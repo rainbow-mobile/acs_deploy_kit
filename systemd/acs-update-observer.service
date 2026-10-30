@@ -1,0 +1,20 @@
+# ACS 업데이트 observer systemd 서비스 템플릿. deploy.sh가 @KIT_DIR@·@ACS_ENV_FILE@를 채워 /etc/systemd/system/에 놓는다.
+# Debugger 버전 탭에서 올린 릴리즈 ZIP(ACS_ROOT/deploy/observe)을 감지해 acs-update.sh로 적용한다.
+[Unit]
+Description=RB ACS Update Observer
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=@KIT_DIR@
+# 설치 설정 파일(ACS_ROOT·compose 프로젝트·Gateway 주소)
+Environment=ACS_ENV_FILE=@ACS_ENV_FILE@
+ExecStart=/bin/bash @KIT_DIR@/acs-observer.sh
+Restart=always
+RestartSec=10
+# compose·docker·설치 디렉터리 파일을 다루므로 root로 실행한다(Muscat muscat-version-observer와 같음).
+User=root
+
+[Install]
+WantedBy=multi-user.target
