@@ -29,7 +29,7 @@ if [ "${1:-}" = "compose" ]; then
     *" config --images "*) for image_name in $FAKE_IMAGES; do echo "$image_name"; done; exit 0 ;;
     *" ps -q "*) echo "cid-${!#}"; exit 0 ;;
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
-    *" ps -a --services "*) [ -f "$FAKE_STATE_DIR/containers-created" ] && printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres; exit 0 ;;
+    *" ps -a --services "*|*" ps --services --status running "*) [ -f "$FAKE_STATE_DIR/containers-created" ] && printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres; exit 0 ;;
     *" up "*) touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
     *" mongodump "*) echo "mongo-backup"; exit 0 ;;
     *" pg_dump "*) echo "pg-backup"; exit 0 ;;
@@ -149,6 +149,7 @@ assert_true "task bin 실행 권한" test -x "$ACS_ROOT/services/task/task.amd64
 assert_true "이미지 load" grep -q "docker load -i" "$FAKE_LOG"
 assert_true "최초 설치는 DB 백업을 하지 않음" bash -c "! grep -q mongodump '$FAKE_LOG'"
 assert_true "최초 설치는 compose up이 만든 컨테이너를 다시 재시작하지 않음" bash -c "! grep -q ' restart ' '$FAKE_LOG'"
+assert_true "최초 설치는 이전 버전 보관본이 없음" bash -c "! ls '$ACS_ROOT'/deploy/archives/*.zip >/dev/null 2>&1"
 
 echo "▶ 현장 파일은 업데이트가 덮어쓰지 않음 + Task만 바꾸는 부분 업데이트"
 echo "listen 13105; # 현장 수정" > "$ACS_ROOT/api-gateway/servers/smc.conf"
@@ -163,6 +164,32 @@ assert_true "현장 서버 블록 보존" grep -q "현장 수정" "$ACS_ROOT/api
 assert_true "업데이트 전 DB 백업" bash -c "ls '$ACS_ROOT'/backups/*-v2/mongo.archive.gz >/dev/null"
 assert_true "task 재시작" grep -q "restart task" "$FAKE_LOG"
 assert_true "바뀐 설정이 없으면 Gateway 재시작 안 함" bash -c "! grep -q 'restart task api-gateway' '$FAKE_LOG'"
+
+echo "▶ 업데이트 전 상태를 버전을 적은 보관본 ZIP으로 남기고, 그 ZIP으로 되돌릴 수 있음"
+snapshot_path="$(ls "$ACS_ROOT"/deploy/archives/acs-rollback-v1-before-v2-*.zip 2>/dev/null | head -n1)"
+assert_true "보관본 ZIP 생성(이름에 이전·새 버전)" test -n "$snapshot_path"
+snapshot_staging="$TEST_ROOT/snapshot-check"
+python3 -I "$KIT_DIR/lib/release_tool.py" extract "$snapshot_path" "$snapshot_staging"
+assert_true "보관본은 그대로 적용할 수 있는 릴리즈 ZIP" python3 -I "$KIT_DIR/lib/release_tool.py" validate "$snapshot_staging" amd64
+assert_equal "보관본 버전은 이전 설치 버전" "v1" "$(json_value "$snapshot_staging/version.json" version)"
+assert_equal "보관본에 담은 서비스(바뀐 서비스만)" "task" "$(python3 -I "$KIT_DIR/lib/release_tool.py" get "$snapshot_staging" services)"
+assert_equal "보관본 task 서비스 버전" "v1" "$(json_value "$snapshot_staging/version.json" services.task.version)"
+assert_equal "어느 버전 적용 전인지" "v2" "$(json_value "$snapshot_staging/version.json" snapshot.replaced_by)"
+assert_true "보관본 task bin은 이전 내용" grep -q "task v1" "$snapshot_staging/services/task/task.amd64.bin"
+assert_true "보관본 .env에는 이미지 태그를 넣지 않음(적용할 때 엔진이 붙임)" bash -c "! grep -q '^ACS_IMAGE_TAG=' '$snapshot_staging/runtime/.env'"
+cp "$snapshot_path" "$TEST_ROOT/acs-v1-snapshot.zip"
+assert_equal "보관본으로 되돌리기 종료 코드" "0" "$(run_update "$TEST_ROOT/acs-v1-snapshot.zip")"
+assert_true "task bin이 v1로 돌아옴" grep -q "task v1" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_equal "되돌린 뒤 task 버전" "v1" "$(json_value "$ACS_ROOT/deploy/installed.json" services.task.version)"
+assert_true "되돌리기 전 상태(v2)도 다시 보관" bash -c "ls '$ACS_ROOT'/deploy/archives/acs-rollback-v2-before-v1-*.zip >/dev/null 2>&1"
+assert_equal "다시 v2 적용" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+
+echo "▶ 설정 파일이 그대로면 compose up 없이 바뀐 서비스만 재시작"
+: > "$FAKE_LOG"
+assert_equal "같은 설정으로 v2(task) 다시 적용" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "compose up 생략" bash -c "! grep -q ' up ' '$FAKE_LOG'"
+assert_true "task만 재시작" grep -q "restart task$" "$FAKE_LOG"
+assert_true "로그에 생략 이유" grep -q "compose up을 건너뜁니다" "$ACS_ROOT/deploy/update.log"
 
 echo "▶ sha256이 맞지 않으면 아무것도 바꾸지 않음"
 python3 -I - "$TEST_ROOT/acs-v3-state.zip" "$TEST_ROOT/acs-v3-broken.zip" <<'PYEOF'

@@ -67,6 +67,7 @@ cd ~/acs_deploy_kit
     status.json · installed.json · observer.json · update.log
     failed/                          적용에 실패한 ZIP(최근 3개)
   backups/<시각>-<버전>/              업데이트 직전 DB 백업(최근 3개)
+  deploy/archives/                   업데이트 직전 보관본(acs-rollback-*.zip, 버전 탭에서 되돌리기·삭제)
   .rollback/                         직전 업데이트 전 설정·bin
 ```
 
@@ -78,12 +79,16 @@ cd ~/acs_deploy_kit
 | validate | ZIP 풀기, 매니페스트 종류·형식·arch, 모든 파일 sha256, site.env·서비스 bin 빠짐 확인 | 아무것도 바꾸지 않음 |
 | images | 이미지 tar가 있으면 `docker load`, compose가 쓰는 이미지가 모두 있는지 확인 | 아무것도 바꾸지 않음 |
 | backup | `mongodump`·`pg_dump`로 `backups/`에 백업 | 아무것도 바꾸지 않음 |
+| snapshot | 바뀔 서비스의 현재 bin·설정을 `deploy/archives/acs-rollback-<이전>-before-<새>-<시각>.zip`으로 보관 | 아무것도 바꾸지 않음 |
 | runtime | 설정 파일 교체(이전 파일은 `.rollback/`) | 되돌림 |
 | swap | 서비스 bin을 같은 디렉터리 안에서 rename으로 교체 | 되돌림 |
 | restart | `compose up -d` 후 바뀐 서비스(설정이 바뀌었으면 Gateway·Zenoh router) 재시작 | 되돌림 |
 | health | 모든 ACS 서비스가 healthy가 될 때까지 대기(기본 180초) | 되돌림 |
 
 - 이미지가 없는 ZIP은 설치된 이미지 태그를 그대로 씁니다. 처음 설치는 이미지가 든 ZIP이어야 합니다.
+- 보관본(`deploy/archives/`)은 업데이트 ZIP과 같은 형식이라 그대로 다시 적용하면 그 버전으로 되돌아갑니다. Debugger Version 탭
+  "보관된 이전 버전"에서 버전·서비스별 버전을 보고 **되돌리기**·**삭제**합니다(자동으로 지우지 않음). 되돌릴 때도 직전 상태가 다시 보관됩니다.
+  `.rollback/`은 실패했을 때 바로 되돌리는 직전 한 단계용입니다.
 - DB는 자동으로 되돌리지 않습니다(마이그레이션은 앞으로만 감). 필요하면 `backups/`의 백업으로 복구합니다.
 - 버전 탭의 "실행 중인 Task가 있어도 바로 적용"·"강제 적용"은 `observe/<이름>.zip.force` 표시를 남겨 wait_tasks를 건너뜁니다.
 - 종료 코드: 0 완료, 75 대기, 1 실패, 2 사용법 오류.

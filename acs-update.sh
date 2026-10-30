@@ -10,6 +10,7 @@
 #   validate   ZIP 풀기, 매니페스트 종류·형식·arch, 모든 파일 sha256, site.env와 서비스 bin 빠짐 확인
 #   images     ZIP에 이미지 tar가 있으면 docker load, compose가 쓰는 이미지가 모두 있는지 확인
 #   backup     MongoDB(mongodump)·PostgreSQL(pg_dump) 백업. 실패하면 아무것도 바꾸지 않고 멈춘다
+#   snapshot   바뀔 서비스의 현재 bin·설정을 deploy/archives/acs-rollback-<이전>-before-<새>-<시각>.zip으로 보관(그대로 적용하면 되돌아감)
 #   runtime    compose·Gateway·Zenoh 설정 교체(이전 파일은 .rollback/에). api-gateway/servers의 현장 파일은 덮어쓰지 않는다
 #   swap       서비스 bin을 같은 디렉터리 안에서 rename으로 교체(컨테이너는 디렉터리를 마운트해 새 파일을 본다)
 #   restart    compose up -d 후 바뀐 서비스(설정이 바뀌었으면 Gateway·Zenoh router도) 재시작
@@ -203,6 +204,14 @@ if [ "$INSTALL_MODE" -eq 0 ] && [ -n "$(acs_compose ps -q mongo 2>/dev/null)" ];
   done
 fi
 
+# ── snapshot ─────────────────────────────────────
+# 바뀔 서비스의 현재 bin·설정을 되돌리기용 릴리즈 ZIP으로 deploy/archives/에 보관한다(버전 탭에서 되돌리기·삭제).
+CURRENT_STAGE="snapshot"
+write_status running snapshot "이전 버전을 보관하는 중"
+snapshot_path="$(release_tool snapshot "$STAGING_DIR" "$ACS_ROOT" "$INSTALLED_FILE" "$DEPLOY_DIR/archives" "$BIN_ARCH" 2> "$STAGING_DIR.err")" \
+  || fail_without_changes "이전 버전을 보관하지 못했습니다: $(tail -n 3 "$STAGING_DIR.err")"
+[ -n "$snapshot_path" ] && log "이전 버전 보관: $snapshot_path"
+
 # ── runtime ──────────────────────────────────────
 CURRENT_STAGE="runtime"
 write_status running runtime "설정 파일을 바꾸는 중"
@@ -253,7 +262,19 @@ CURRENT_STAGE="restart"
 write_status running restart "서비스를 다시 시작하는 중"
 # compose up이 새로 만든 컨테이너는 이미 새 bin·설정으로 떠 있으므로, 원래 있던 컨테이너만 재시작한다.
 existing_services=" $(acs_compose ps -a --services 2>/dev/null | tr '\n' ' ') "
-acs_compose up -d --no-build --pull never --remove-orphans || fail_with_rollback "compose up에 실패했습니다"
+running_services=" $(acs_compose ps --services --status running 2>/dev/null | tr '\n' ' ') "
+# 설정이 그대로고 모든 컨테이너가 떠 있으면 compose up을 하지 않는다. up은 바뀐 것이 없어도 모든 컨테이너 상태와
+# 의존 순서(Waiting·Healthy)를 출력해 전체를 다시 띄우는 것처럼 보이고, 확인 시간만 든다. bin만 바뀐 서비스는 아래에서 재시작한다.
+compose_up_needed=0
+[ ${#changed_runtime_paths[@]} -gt 0 ] && compose_up_needed=1
+for service_name in "${ACS_SERVICES[@]}" api-gateway zenoh-router mongo postgres; do
+  [[ "$running_services" == *" $service_name "* ]] || compose_up_needed=1
+done
+if [ "$compose_up_needed" -eq 1 ]; then
+  acs_compose up -d --no-build --pull never --remove-orphans || fail_with_rollback "compose up에 실패했습니다"
+else
+  log "설정 파일이 그대로이고 모든 컨테이너가 실행 중이라 compose up을 건너뜁니다."
+fi
 candidate_targets=("${UPDATED_SERVICES[@]}")
 for relative_path in "${changed_runtime_paths[@]}"; do
   case "$relative_path" in

@@ -13,6 +13,7 @@
     record <installed.json> <staging> <images_tag> <result> <message>
     installed-get <installed.json> <key>         설치 정보 값(version, images_tag)
     make-site-env <zip> <site.env> <frs_url> <moms_url>  ZIP의 site.env.example로 site.env를 만들고 DB 비밀번호를 무작위로 채움
+    snapshot <staging> <acs_root> <installed.json> <archives_dir> <arch>  바뀔 서비스의 현재 bin·설정을 되돌리기용 릴리즈 ZIP으로 보관
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import socket
 import sys
@@ -290,6 +292,105 @@ def make_site_env(archive_name: str, site_env_name: str, frs_url: str, moms_url:
     os.chmod(site_env_path, 0o600)
 
 
+# 보관본 .env에서 뺄 이미지 태그 줄입니다. 보관본을 적용할 때 엔진이 설치된 이미지 태그를 다시 붙입니다.
+IMAGE_TAG_LINE_PREFIXES = ("ACS_IMAGE_TAG=", "# Gateway·Zenoh router 이미지 태그")
+
+
+def snapshot(staging_name: str, acs_root_name: str, installed_name: str, archives_name: str, architecture: str) -> None:
+    """업데이트로 바뀔 서비스의 현재 bin과 현재 설정을 되돌리기용 릴리즈 ZIP으로 보관하고 그 경로를 출력합니다.
+
+    보관본은 업데이트 ZIP과 같은 형식(acs.release)이라 다시 적용하면 그대로 되돌아갑니다. 바뀔 서비스만 담고,
+    매니페스트에 서비스별 이전 버전과 어느 버전 적용 전인지(snapshot.replaced_by)를 적습니다.
+    바뀔 서비스가 아직 설치되지 않았으면(최초 설치) 아무것도 만들지 않고 빈 줄을 출력합니다.
+
+    Args:
+        staging_name (str): 적용할 릴리즈를 푼 디렉터리입니다.
+        acs_root_name (str): 설치 디렉터리입니다.
+        installed_name (str): installed.json 경로입니다.
+        archives_name (str): 보관본을 둘 디렉터리입니다.
+        architecture (str): 이 PC arch입니다.
+    """
+    staging_directory = Path(staging_name)
+    acs_root = Path(acs_root_name)
+    new_manifest = load_manifest(staging_directory)
+    installed = read_json(Path(installed_name))
+    previous_version = str(installed.get("version") or "unknown")
+    installed_services = installed.get("services") or {}
+    service_files = {}
+    for service_name in sorted(new_manifest.get("services") or {}):
+        bin_relative_path = f"services/{service_name}/{service_name}.{architecture}.bin"
+        if (acs_root / bin_relative_path).is_file():
+            service_files[service_name] = bin_relative_path
+    if not service_files:
+        print("")
+        return
+
+    runtime_path = (new_manifest.get("runtime") or {}).get("path") or "runtime"
+    runtime_contents = {}
+    for relative_path in ((new_manifest.get("runtime") or {}).get("files") or {}):
+        installed_path = acs_root / relative_path
+        if not installed_path.is_file():
+            continue
+        file_bytes = installed_path.read_bytes()
+        if relative_path == ".env":
+            file_bytes = "".join(
+                env_line for env_line in file_bytes.decode("utf-8").splitlines(keepends=True)
+                if not env_line.startswith(IMAGE_TAG_LINE_PREFIXES)
+            ).encode("utf-8")
+        runtime_contents[relative_path] = file_bytes
+
+    taken_at = datetime.now(timezone.utc)
+    snapshot_manifest = {
+        "kind": RELEASE_KIND,
+        "format_version": SUPPORTED_FORMAT_VERSION,
+        "version": previous_version,
+        "created_at": taken_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "git_commit": installed.get("git_commit"),
+        "arch": architecture,
+        "services": {
+            service_name: {
+                "version": (installed_services.get(service_name) or {}).get("version") or previous_version,
+                "path": bin_relative_path,
+                "sha256": file_sha256(acs_root / bin_relative_path),
+            }
+            for service_name, bin_relative_path in service_files.items()
+        },
+        "runtime": {
+            "path": runtime_path,
+            "files": {relative_path: hashlib.sha256(file_bytes).hexdigest() for relative_path, file_bytes in runtime_contents.items()},
+        },
+        "images": {"tag": None, "names": [], "archive": None, "sha256": None},
+        "snapshot": {"replaced_by": new_manifest.get("version"), "taken_at": taken_at.strftime("%Y-%m-%dT%H:%M:%SZ")},
+    }
+    archives_directory = Path(archives_name)
+    archives_directory.mkdir(parents=True, exist_ok=True)
+
+    def safe_label(version_label: str) -> str:
+        """파일 이름에 쓸 수 있게 버전 이름의 특수 문자를 바꿉니다.
+
+        Args:
+            version_label (str): 버전 이름입니다.
+
+        Returns:
+            str: 영문·숫자·.-_만 남긴 이름입니다.
+        """
+        return re.sub(r"[^A-Za-z0-9._-]", "_", version_label)
+
+    archive_name = f"acs-rollback-{safe_label(previous_version)}-before-{safe_label(str(new_manifest.get('version')))}-{taken_at.astimezone().strftime('%Y%m%d-%H%M%S')}.zip"
+    archive_path = archives_directory / archive_name
+    # 쓰는 동안은 .zip이 아닌 이름이라 화면 목록과 observer에 보이지 않습니다.
+    partial_path = archives_directory / f".{archive_name}.part"
+    with zipfile.ZipFile(partial_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as snapshot_archive:
+        snapshot_archive.writestr("version.json", json.dumps(snapshot_manifest, ensure_ascii=False, indent=2) + "\n")
+        for bin_relative_path in service_files.values():
+            snapshot_archive.write(acs_root / bin_relative_path, bin_relative_path)
+        for relative_path, file_bytes in runtime_contents.items():
+            snapshot_archive.writestr(f"{runtime_path}/{relative_path}", file_bytes)
+    os.chmod(partial_path, 0o644)
+    os.replace(partial_path, archive_path)
+    print(archive_path)
+
+
 def main(arguments: list[str]) -> None:
     """명령 이름으로 처리 함수를 고릅니다.
 
@@ -317,6 +418,8 @@ def main(arguments: list[str]) -> None:
         installed_get(*command_arguments)
     elif command_name == "make-site-env" and len(command_arguments) == 4:
         make_site_env(*command_arguments)
+    elif command_name == "snapshot" and len(command_arguments) == 5:
+        snapshot(*command_arguments)
     else:
         fail(f"알 수 없는 명령이거나 인자 수가 다릅니다: {' '.join(arguments)}")
 
