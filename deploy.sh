@@ -1,7 +1,7 @@
 #!/bin/bash
 # deploy.sh — 현장 PC에 ACS를 처음 설치하고, 부팅 때 자동으로 뜨도록 등록한다.
 # 사용법: ./deploy.sh <acs-<버전>.zip> [옵션]
-#   릴리즈 ZIP은 rb_acs에서 `make release VERSION=v1.2.3 IMAGES=1`로 만든다(최초 설치는 이미지가 든 ZIP).
+#   릴리즈 ZIP은 rb_acs에서 `make backend.deploy`로 만든다(최초 설치는 이미지 포함을 고른 ZIP).
 #
 #   --root=<디렉터리>        설치 디렉터리 (기본: 배포 키트 옆 rb-acs, 예: ~/rb-acs)
 #   --project=<이름>         compose 프로젝트 이름 (기본: rb-acs)

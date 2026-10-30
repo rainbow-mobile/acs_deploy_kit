@@ -7,7 +7,7 @@
 
 ```mermaid
 flowchart TD
-  A["개발 PC: rb_acs make release"] --> B["acs-&lt;버전&gt;.zip"]
+  A["개발 PC: rb_acs make backend.deploy"] --> B["acs-&lt;버전&gt;.zip"]
   B -->|"최초 설치(USB 등)"| C["deploy.sh"]
   B -->|"업데이트"| D["Debugger 버전 탭 업로드"]
   D --> E["Common: 검증 후 deploy/observe/에 저장"]
@@ -18,9 +18,11 @@ flowchart TD
   H --> I["Common이 socket으로 버전 탭에 push"]
 ```
 
-1. 개발 PC(인터넷 가능, linux/amd64)에서 rb_acs 저장소로 릴리즈 ZIP을 만듭니다.
-   - 최초 설치: `make release VERSION=v1.2.3 IMAGES=1` (런타임·Gateway·Zenoh router·MongoDB·PostgreSQL 이미지 포함)
-   - 업데이트: `make release VERSION=v1.2.4` 또는 바뀐 서비스만 `make release VERSION=v1.2.4 SERVICES=task,state`
+1. 개발 PC(인터넷 가능, linux/amd64)의 rb_acs 저장소에서 `make backend.deploy`를 실행해 질문에 답합니다.
+   - 배포 종류: 정식 릴리즈(origin 마지막 `vX.Y.Z` 태그에서 patch·minor·major로 올려 태그·push) 또는 시험 빌드
+   - 업데이트 서비스: 전체 또는 바뀐 서비스만
+   - 결과: 개발 PC `~/acs-release/`에 `acs-<버전>-install.zip`(처음 설치용, 이미지 포함)과 `acs-<버전>-update.zip`(업데이트용).
+     Slack을 설정했으면 배포 알림과 함께 업데이트 ZIP이 채널 스레드에 올라갑니다.
 2. 현장 PC에 이 키트와 ZIP을 가져가 `deploy.sh`로 설치합니다.
 3. 이후 업데이트는 브라우저에서 `http://<현장PC>:13000/state/debugger/` → **Version** 탭 → ZIP 업로드로 합니다. 인터넷이 필요 없습니다.
 
@@ -29,7 +31,7 @@ flowchart TD
 ```bash
 git clone https://github.com/rainbow-mobile/acs_deploy_kit.git ~/acs_deploy_kit   # 또는 USB로 복사
 cd ~/acs_deploy_kit
-./deploy.sh ~/acs-v1.2.3.zip --frs-url=http://192.168.0.10:3000 --moms-url=http://192.168.0.20:8080
+./deploy.sh ~/acs-v1.2.3-install.zip --frs-url=http://192.168.0.10:3000 --moms-url=http://192.168.0.20:8080
 ```
 
 | 옵션 | 기본값 | 설명 |

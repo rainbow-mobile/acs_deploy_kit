@@ -125,7 +125,7 @@ def load_manifest(staging_directory: Path) -> dict:
     """
     manifest = read_json(staging_directory / "version.json")
     if not manifest:
-        fail("version.json이 없거나 읽을 수 없습니다. make release로 만든 릴리즈 ZIP인지 확인하세요.")
+        fail("version.json이 없거나 읽을 수 없습니다. make backend.deploy로 만든 릴리즈 ZIP인지 확인하세요.")
     return manifest
 
 

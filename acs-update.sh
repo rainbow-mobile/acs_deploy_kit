@@ -1,5 +1,5 @@
 #!/bin/bash
-# acs-update.sh — ACS 릴리즈 ZIP(rb_acs `make release`)을 설치 디렉터리에 적용하는 업데이트 엔진.
+# acs-update.sh — ACS 릴리즈 ZIP(rb_acs `make backend.deploy`)을 설치 디렉터리에 적용하는 업데이트 엔진.
 # 사용법: acs-update.sh [--install] [--force] <acs-<버전>.zip>
 #   --install  최초 설치(deploy.sh가 부름). 실행 중 Task 확인·DB 백업을 건너뛴다.
 #   --force    실행 중 Task가 있어도 적용한다(버전 탭 "강제 적용", observe/<이름>.zip.force).
@@ -167,7 +167,7 @@ else
     IMAGE_TAG="$(sed -n 's/^ACS_IMAGE_TAG=//p' "$ACS_ROOT/.env" | tail -n1)"
   fi
 fi
-[ -n "$IMAGE_TAG" ] || fail_without_changes "설치된 이미지 태그를 모릅니다. 처음 설치는 이미지가 든 릴리즈 ZIP(make release IMAGES=1)으로 하세요."
+[ -n "$IMAGE_TAG" ] || fail_without_changes "설치된 이미지 태그를 모릅니다. 처음 설치는 이미지가 든 릴리즈 ZIP(rb_acs make backend.deploy에서 이미지 포함)으로 하세요."
 cp "$STAGING_DIR/runtime/.env" "$STAGING_DIR/runtime/.env.with-tag"
 {
   echo "# Gateway·Zenoh router 이미지 태그(acs-update.sh가 설치된 이미지 기준으로 붙임)"
@@ -182,7 +182,7 @@ missing_images=()
 for image_name in $required_images; do
   docker image inspect "$image_name" >/dev/null 2>&1 || missing_images+=("$image_name")
 done
-[ ${#missing_images[@]} -eq 0 ] || fail_without_changes "필요한 이미지가 없습니다: ${missing_images[*]}. 이미지가 든 릴리즈 ZIP(make release IMAGES=1)을 올리세요."
+[ ${#missing_images[@]} -eq 0 ] || fail_without_changes "필요한 이미지가 없습니다: ${missing_images[*]}. 이미지가 든 릴리즈 ZIP(rb_acs make backend.deploy에서 이미지 포함)을 올리세요."
 
 # ── backup ───────────────────────────────────────
 CURRENT_STAGE="backup"
