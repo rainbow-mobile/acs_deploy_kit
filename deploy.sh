@@ -15,14 +15,14 @@
 # 하는 일(Muscat muscat-deploy.sh 순서를 따른다):
 #   1. arch·필수 명령 확인. docker가 없고 인터넷이 되면 apt로 설치를 시도한다
 #   2. 설정 파일(/etc/rainbow/acs-env.conf)에 설치 디렉터리·프로젝트·Gateway 주소를 적는다(observer가 root로 읽음)
-#   3. site.env 준비 → acs-update.sh --install로 이미지 load·설정·서비스 bin 배치·compose up·헬스체크
+#   3. site.env 준비 → update.sh --install로 이미지 load·설정·서비스 bin 배치·compose up·헬스체크
 #   4. docker 부팅 자동 시작(compose restart: unless-stopped로 컨테이너도 함께 뜬다)과 observer systemd 등록
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
-. "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=common.sh
+. "$SCRIPT_DIR/common.sh"
 
 PACKAGE_PATH=""
 OPTION_ROOT=""
@@ -131,7 +131,7 @@ fi
 write_env_file() {
   local env_content
   env_content="$(cat <<EOF
-# RB ACS 설치 설정(deploy.sh가 씀). acs-observer.sh(root)·acs-update.sh·acs-ctl.sh가 읽는다.
+# RB ACS 설치 설정(deploy.sh가 씀). observer.sh(root)·update.sh·reset.sh가 읽는다.
 # 설치 디렉터리: compose·서비스 bin·deploy/(업데이트 디렉터리)·backups/
 ACS_ROOT="$ACS_ROOT"
 # compose 프로젝트 이름(컨테이너 이름 <프로젝트>-<서비스>-1)
@@ -167,20 +167,36 @@ else
   echo "📝 기존 site.env를 그대로 씁니다."
 fi
 
-bash "$SCRIPT_DIR/acs-update.sh" --install "$PACKAGE_PATH"
+bash "$SCRIPT_DIR/update.sh" --install "$PACKAGE_PATH"
 
 # ── 4. 자동 실행 등록 ─────────────────────────────
 if [ "$REGISTER_SYSTEMD" -eq 1 ]; then
   # 컨테이너는 compose restart: unless-stopped라 docker만 부팅 때 뜨면 함께 올라온다.
   sudo systemctl enable docker >/dev/null 2>&1 || echo "⚠️  docker 부팅 자동 시작을 켜지 못했습니다."
-  sed -e "s#@KIT_DIR@#$SCRIPT_DIR#g" -e "s#@ACS_ENV_FILE@#$ACS_ENV_FILE#g" "$SCRIPT_DIR/systemd/$OBSERVER_SERVICE_NAME.service" \
-    | sudo tee "/etc/systemd/system/$OBSERVER_SERVICE_NAME.service" > /dev/null
+  sudo tee "/etc/systemd/system/$OBSERVER_SERVICE_NAME.service" > /dev/null <<EOF
+[Unit]
+Description=RB ACS Update Observer
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+Environment=ACS_ENV_FILE=$ACS_ENV_FILE
+ExecStart=/bin/bash $SCRIPT_DIR/observer.sh
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
   sudo systemctl daemon-reload
   sudo systemctl enable "$OBSERVER_SERVICE_NAME" >/dev/null
   sudo systemctl restart "$OBSERVER_SERVICE_NAME"
   echo "✅ $OBSERVER_SERVICE_NAME 서비스 등록 완료(로그: journalctl -u $OBSERVER_SERVICE_NAME -f)"
 else
-  echo "ℹ️  --no-systemd: observer를 등록하지 않았습니다. 직접 실행: ACS_ENV_FILE=$ACS_ENV_FILE bash $SCRIPT_DIR/acs-observer.sh"
+  echo "ℹ️  --no-systemd: observer를 등록하지 않았습니다. 직접 실행: ACS_ENV_FILE=$ACS_ENV_FILE bash $SCRIPT_DIR/observer.sh"
 fi
 
 echo ""
@@ -189,4 +205,4 @@ echo "║   RB ACS 설치 완료 ✅            ║"
 echo "╚══════════════════════════════════╝"
 echo "  버전: $(release_tool installed-get "$INSTALLED_FILE" version)"
 echo "  Debugger: $ACS_GATEWAY_URL/state/debugger/  (버전 탭에서 업데이트 ZIP 업로드)"
-echo "  상태 확인: $SCRIPT_DIR/acs-ctl.sh status"
+echo "  상태 파일: $STATUS_FILE"

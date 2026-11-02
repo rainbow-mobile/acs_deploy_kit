@@ -8,8 +8,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
-. "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=common.sh
+. "$SCRIPT_DIR/common.sh"
 load_acs_env
 
 PURGE=0

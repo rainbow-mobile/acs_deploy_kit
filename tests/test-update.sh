@@ -1,7 +1,7 @@
 #!/bin/bash
-# tests/test-update-engine.sh — 실제 컨테이너 없이 deploy.sh·acs-update.sh·acs-observer.sh 흐름을 검증한다.
+# tests/test-update.sh — 실제 컨테이너 없이 deploy.sh·update.sh·observer.sh 흐름을 검증한다.
 # 가짜 docker·curl을 PATH 앞에 두고, 작은 가짜 릴리즈 ZIP으로 설치·부분 업데이트·검증 실패·Task 대기·롤백을 확인한다.
-# 사용법: bash tests/test-update-engine.sh
+# 사용법: bash tests/test-update.sh
 
 set -uo pipefail
 
@@ -123,8 +123,8 @@ assert_true() {  # <설명> <명령...>
   TEST_COUNT=$((TEST_COUNT + 1))
   if "$@"; then echo "  ✔ $description"; else echo "  ✘ $description"; FAILURES=$((FAILURES + 1)); fi
 }
-run_update() {  # acs-update.sh 종료 코드를 돌려준다(출력은 숨김).
-  bash "$KIT_DIR/acs-update.sh" "$@" >/dev/null 2>&1
+run_update() {  # update.sh 종료 코드를 돌려준다(출력은 숨김).
+  bash "$KIT_DIR/update.sh" "$@" >/dev/null 2>&1
   echo $?
 }
 
@@ -169,10 +169,10 @@ echo "▶ 업데이트 전 상태를 버전을 적은 보관본 ZIP으로 남기
 snapshot_path="$(ls "$ACS_ROOT"/deploy/archives/acs-rollback-v1-before-v2-*.zip 2>/dev/null | head -n1)"
 assert_true "보관본 ZIP 생성(이름에 이전·새 버전)" test -n "$snapshot_path"
 snapshot_staging="$TEST_ROOT/snapshot-check"
-python3 -I "$KIT_DIR/lib/release_tool.py" extract "$snapshot_path" "$snapshot_staging"
-assert_true "보관본은 그대로 적용할 수 있는 릴리즈 ZIP" python3 -I "$KIT_DIR/lib/release_tool.py" validate "$snapshot_staging" amd64
+python3 -I "$KIT_DIR/release.py" extract "$snapshot_path" "$snapshot_staging"
+assert_true "보관본은 그대로 적용할 수 있는 릴리즈 ZIP" python3 -I "$KIT_DIR/release.py" validate "$snapshot_staging" amd64
 assert_equal "보관본 버전은 이전 설치 버전" "v1" "$(json_value "$snapshot_staging/version.json" version)"
-assert_equal "보관본에 담은 서비스(바뀐 서비스만)" "task" "$(python3 -I "$KIT_DIR/lib/release_tool.py" get "$snapshot_staging" services)"
+assert_equal "보관본에 담은 서비스(바뀐 서비스만)" "task" "$(python3 -I "$KIT_DIR/release.py" get "$snapshot_staging" services)"
 assert_equal "보관본 task 서비스 버전" "v1" "$(json_value "$snapshot_staging/version.json" services.task.version)"
 assert_equal "어느 버전 적용 전인지" "v2" "$(json_value "$snapshot_staging/version.json" snapshot.replaced_by)"
 assert_true "보관본 task bin은 이전 내용" grep -q "task v1" "$snapshot_staging/services/task/task.amd64.bin"
@@ -236,23 +236,23 @@ rm -f "$FAKE_STATE_DIR/missing-image"
 
 echo "▶ observer: 성공 ZIP은 지우고, 대기 ZIP은 두고, 실패 ZIP은 failed/로"
 cp "$TEST_ROOT/acs-v4-task.zip" "$ACS_ROOT/deploy/observe/acs-v4-task.zip"
-bash "$KIT_DIR/acs-observer.sh" --once >/dev/null 2>&1
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "적용한 ZIP 삭제" test ! -e "$ACS_ROOT/deploy/observe/acs-v4-task.zip"
 assert_true "task bin은 v4" grep -q "task v4" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "heartbeat 기록" test -f "$ACS_ROOT/deploy/observer.json"
 echo '[{"state":"action_required"}]' > "$FAKE_STATE_DIR/executions.json"
 make_release "$TEST_ROOT/acs-v5-task.zip" v5 task -
 cp "$TEST_ROOT/acs-v5-task.zip" "$ACS_ROOT/deploy/observe/acs-v5-task.zip"
-bash "$KIT_DIR/acs-observer.sh" --once >/dev/null 2>&1
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "대기 ZIP은 남김" test -f "$ACS_ROOT/deploy/observe/acs-v5-task.zip"
 assert_equal "observer 대기 상태" "waiting" "$(json_value "$ACS_ROOT/deploy/status.json" state)"
 touch "$ACS_ROOT/deploy/observe/acs-v5-task.zip.force"
-bash "$KIT_DIR/acs-observer.sh" --once >/dev/null 2>&1
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "강제 표시가 있으면 적용" grep -q "task v5" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "강제 표시 삭제" test ! -e "$ACS_ROOT/deploy/observe/acs-v5-task.zip.force"
 rm -f "$FAKE_STATE_DIR/executions.json"
 cp "$TEST_ROOT/acs-v3-broken.zip" "$ACS_ROOT/deploy/observe/acs-v3-broken.zip"
-bash "$KIT_DIR/acs-observer.sh" --once >/dev/null 2>&1
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "실패 ZIP은 failed/로" test -f "$ACS_ROOT/deploy/failed/acs-v3-broken.zip"
 assert_true "실패 ZIP은 observe/에서 빠짐" test ! -e "$ACS_ROOT/deploy/observe/acs-v3-broken.zip"
 assert_equal "status의 ZIP 이름은 원래 이름" "acs-v3-broken.zip" "$(json_value "$ACS_ROOT/deploy/status.json" package)"

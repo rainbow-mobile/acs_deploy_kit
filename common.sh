@@ -1,12 +1,11 @@
 #!/bin/bash
-# lib/common.sh — 함수와 기본값만 정의한다. deploy.sh·acs-update.sh·acs-observer.sh·acs-ctl.sh·reset.sh가 source한다.
+# common.sh — 함수와 기본값만 정의한다. deploy.sh·update.sh·observer.sh·reset.sh가 읽는다.
 # Muscat 키트(rainbow-deploy-kit/muscat)의 /etc/rainbow/muscat-env.conf·DEPLOY_ROOT 구성을 따른다.
 
 # 설치 설정 파일. deploy.sh가 쓰고 observer(root)가 읽는다. 테스트·sudo 없는 PC는 ACS_ENV_FILE로 바꾼다.
 ACS_ENV_FILE="${ACS_ENV_FILE:-/etc/rainbow/acs-env.conf}"
-KIT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KIT_DIR="$(dirname "$KIT_LIB_DIR")"
-RELEASE_TOOL="$KIT_LIB_DIR/release_tool.py"
+KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASE_TOOL="$KIT_DIR/release.py"
 
 # 설정 파일 값을 읽는다. 없으면 기본값을 쓴다(deploy.sh 최초 실행 전).
 load_acs_env() {

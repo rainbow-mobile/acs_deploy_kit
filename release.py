@@ -1,4 +1,4 @@
-"""ACS 릴리즈 ZIP 처리 보조 도구입니다. acs-update.sh·acs-observer.sh가 부릅니다.
+"""ACS 릴리즈 ZIP 처리 보조 도구입니다. update.sh·observer.sh가 부릅니다.
 
 오프라인 현장에는 jq·unzip이 없을 수 있어 Ubuntu 기본 python3의 표준 라이브러리만 씁니다.
 항상 `python3 -I`(현재 디렉터리·사용자 site 무시)로 실행합니다.

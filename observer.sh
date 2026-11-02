@@ -1,5 +1,5 @@
 #!/bin/bash
-# acs-observer.sh — 업데이트 디렉터리(ACS_ROOT/deploy/observe)를 감시하다가 릴리즈 ZIP이 오면 acs-update.sh로 적용한다.
+# observer.sh — 업데이트 디렉터리(ACS_ROOT/deploy/observe)를 감시하다가 릴리즈 ZIP이 오면 update.sh로 적용한다.
 # systemd 서비스(acs-update-observer)로 상시 실행된다. deploy.sh가 등록한다.
 # Debugger 버전 탭 업로드 → Common이 observe/<이름>.zip으로 놓음 → 여기서 감지 → 적용 → status.json·installed.json 기록.
 #
@@ -11,11 +11,11 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
-. "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=common.sh
+. "$SCRIPT_DIR/common.sh"
 load_acs_env
 
-UPDATE_SCRIPT="$SCRIPT_DIR/acs-update.sh"
+UPDATE_SCRIPT="$SCRIPT_DIR/update.sh"
 FAILED_DIR="$DEPLOY_DIR/failed"
 # 남겨 둘 실패 ZIP 개수
 FAILED_KEEP=3

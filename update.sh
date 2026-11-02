@@ -1,6 +1,6 @@
 #!/bin/bash
-# acs-update.sh — ACS 릴리즈 ZIP(rb_acs `make backend.deploy`)을 설치 디렉터리에 적용하는 업데이트 엔진.
-# 사용법: acs-update.sh [--install] [--force] <acs-<버전>.zip>
+# update.sh — ACS 릴리즈 ZIP(rb_acs `make backend.deploy`)을 설치 디렉터리에 적용하는 업데이트 엔진.
+# 사용법: update.sh [--install] [--force] <acs-<버전>.zip>
 #   --install  최초 설치(deploy.sh가 부름). 실행 중 Task 확인·DB 백업을 건너뛴다.
 #   --force    실행 중 Task가 있어도 적용한다(버전 탭 "강제 적용", observe/<이름>.zip.force).
 # 종료 코드: 0 적용 완료, 75 실행 중 Task 때문에 대기(ZIP을 두고 나중에 다시), 1 실패(바꾼 것은 되돌림), 2 사용법 오류.
@@ -20,8 +20,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/common.sh
-. "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=common.sh
+. "$SCRIPT_DIR/common.sh"
 load_acs_env
 
 INSTALL_MODE=0
@@ -85,7 +85,7 @@ fail_with_rollback() {  # <message>
   rollback_changes
   local rollback_result="이전 버전으로 되돌렸습니다"
   if ! wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${ACS_SERVICES[@]}" >/dev/null; then
-    rollback_result="되돌린 뒤에도 일부 서비스가 healthy가 아닙니다. acs-ctl.sh status로 확인하세요"
+    rollback_result="되돌린 뒤에도 일부 서비스가 healthy가 아닙니다. docker compose 상태와 $UPDATE_LOG 로그를 확인하세요"
   fi
   write_status failed rollback "$failure_message. $rollback_result"
   release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "" failed "$failure_message. $rollback_result" || true
@@ -171,7 +171,7 @@ fi
 [ -n "$IMAGE_TAG" ] || fail_without_changes "설치된 이미지 태그를 모릅니다. 처음 설치는 이미지가 든 릴리즈 ZIP(rb_acs make backend.deploy에서 이미지 포함)으로 하세요."
 cp "$STAGING_DIR/runtime/.env" "$STAGING_DIR/runtime/.env.with-tag"
 {
-  echo "# Gateway·Zenoh router 이미지 태그(acs-update.sh가 설치된 이미지 기준으로 붙임)"
+  echo "# Gateway·Zenoh router 이미지 태그(update.sh가 설치된 이미지 기준으로 붙임)"
   echo "ACS_IMAGE_TAG=$IMAGE_TAG"
 } >> "$STAGING_DIR/runtime/.env.with-tag"
 staged_compose_files=(-f "$STAGING_DIR/runtime/compose.yml" -f "$STAGING_DIR/runtime/compose.offline.yml")
