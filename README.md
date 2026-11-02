@@ -39,7 +39,8 @@ tests/
 | `--gateway-url=<주소>` | `http://127.0.0.1:13000` | 실행 중 Task 확인 주소 |
 | `--site-env=<파일>` | 없음 | 기존 현장 설정 복사 |
 | `--site-compose=<파일>` | 없음 | 현장 compose 덮어쓰기 |
-| `--online-url=<주소>` | 없음 | `latest.json`이 있는 S3/CloudFront 공개 URL |
+| `--online-channel=<이름>` | `main` | `acs/<채널>` 온라인 배포 채널 |
+| `--online-url=<주소>` | `https://diokjo4dtg1mp.cloudfront.net/acs/main` | 별도 배포 URL을 사용할 때 덮어쓰기 |
 | `--auto-update` | 사용 안 함 | 온라인 최신 버전 자동 적용 활성화 |
 | `--no-auto-update` | 기본값 | 기존 온라인 자동 적용 설정도 해제 |
 | `--no-systemd` | 등록함 | 시험용으로 observer 등록 생략 |
@@ -50,9 +51,10 @@ tests/
 
 ```bash
 ./deploy.sh acs-v1.2.3-install.zip \
-  --online-url=https://배포도메인/acs/releases \
   --auto-update
 ```
+
+`develop` 채널을 사용하려면 `--online-channel=develop`을 함께 지정합니다.
 
 observer는 로컬로 업로드된 ZIP을 항상 먼저 처리합니다. 로컬 ZIP이 없고 자동배포가 켜진 경우에만
 `latest.json`을 조회하며, 현재보다 높은 버전의 업데이트 ZIP을 내려받아 SHA-256 검증 후 기존 `update.sh`로 적용합니다.

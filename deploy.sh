@@ -11,6 +11,7 @@
 #   --moms-url=<주소>        site.env를 새로 만들 때 넣을 SMC MOMS 주소
 #   --site-compose=<파일>    현장 compose 덮어쓰기(compose.site.yml, 포트 변경 등). 업데이트해도 바뀌지 않는다
 #   --online-url=<주소>      latest.json이 있는 S3/CloudFront 공개 URL
+#   --online-channel=<이름>  온라인 배포 채널 (기본: main, URL은 .../acs/<채널>)
 #   --auto-update            온라인 최신 릴리즈 자동 적용(기본값: 사용 안 함)
 #   --no-auto-update         온라인 자동 적용 끄기(기존 설정도 해제)
 #   --no-systemd             observer systemd 등록과 docker 부팅 자동 시작을 건너뛴다(시험용, sudo 없는 PC)
@@ -32,6 +33,7 @@ OPTION_ROOT=""
 OPTION_PROJECT=""
 OPTION_GATEWAY_URL=""
 OPTION_ONLINE_URL=""
+OPTION_ONLINE_CHANNEL=""
 OPTION_AUTO_UPDATE=""
 SITE_ENV_SOURCE=""
 SITE_COMPOSE_SOURCE=""
@@ -48,6 +50,7 @@ while [ $# -gt 0 ]; do
     --project=*) OPTION_PROJECT="${1#*=}" ;;
     --gateway-url=*) OPTION_GATEWAY_URL="${1#*=}" ;;
     --online-url=*) OPTION_ONLINE_URL="${1#*=}" ;;
+    --online-channel=*) OPTION_ONLINE_CHANNEL="${1#*=}" ;;
     --auto-update) OPTION_AUTO_UPDATE=1 ;;
     --no-auto-update) OPTION_AUTO_UPDATE=0 ;;
     --site-env=*) SITE_ENV_SOURCE="${1#*=}" ;;
@@ -69,7 +72,12 @@ load_acs_env
 ACS_ROOT="${OPTION_ROOT:-$ACS_ROOT}"
 ACS_PROJECT="${OPTION_PROJECT:-$ACS_PROJECT}"
 ACS_GATEWAY_URL="${OPTION_GATEWAY_URL:-$ACS_GATEWAY_URL}"
-ACS_RELEASE_BASE_URL="${OPTION_ONLINE_URL:-$ACS_RELEASE_BASE_URL}"
+ACS_RELEASE_CHANNEL="${OPTION_ONLINE_CHANNEL:-$ACS_RELEASE_CHANNEL}"
+if [ -n "$OPTION_ONLINE_URL" ]; then
+  ACS_RELEASE_BASE_URL="$OPTION_ONLINE_URL"
+elif [ -n "$OPTION_ONLINE_CHANNEL" ]; then
+  ACS_RELEASE_BASE_URL="$DEFAULT_RELEASE_ORIGIN/$ACS_RELEASE_CHANNEL"
+fi
 ACS_RELEASE_BASE_URL="${ACS_RELEASE_BASE_URL%/}"
 ACS_ONLINE_AUTO_UPDATE="${OPTION_AUTO_UPDATE:-$ACS_ONLINE_AUTO_UPDATE}"
 if [ "$ACS_ONLINE_AUTO_UPDATE" = "1" ] && [ -z "$ACS_RELEASE_BASE_URL" ]; then
@@ -155,6 +163,7 @@ ACS_PROJECT="$ACS_PROJECT"
 ACS_GATEWAY_URL="$ACS_GATEWAY_URL"
 # 온라인 자동배포. 기본은 0이며 1일 때만 observer가 네트워크를 조회한다
 ACS_ONLINE_AUTO_UPDATE="$ACS_ONLINE_AUTO_UPDATE"
+ACS_RELEASE_CHANNEL="$ACS_RELEASE_CHANNEL"
 ACS_RELEASE_BASE_URL="$ACS_RELEASE_BASE_URL"
 EOF
 )"
