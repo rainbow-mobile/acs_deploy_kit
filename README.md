@@ -79,7 +79,9 @@ observer는 로컬로 업로드된 ZIP을 항상 먼저 처리합니다. 로컬 
 
 ```bash
 ./update.sh acs-v1.2.4-update.zip
+./update.sh --online                    # main 채널 최신 버전을 지금 수동 적용
 ./update.sh --force acs-v1.2.4-update.zip
+./update.sh --force --online            # 실행 중 Task가 있어도 온라인 최신 버전 적용
 journalctl -u acs-update-observer -f
 cat /설치경로/deploy/status.json
 ./reset.sh

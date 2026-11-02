@@ -1,8 +1,9 @@
 #!/bin/bash
 # update.sh — ACS 릴리즈 ZIP(rb_acs `make backend.deploy`)을 설치 디렉터리에 적용하는 업데이트 엔진.
-# 사용법: update.sh [--install] [--force] <acs-<버전>.zip>
+# 사용법: update.sh [--install] [--force] <acs-<버전>.zip> | update.sh [--force] --online
 #   --install  최초 설치(deploy.sh가 부름). 실행 중 Task 확인·DB 백업을 건너뛴다.
 #   --force    실행 중 Task가 있어도 적용한다(버전 탭 "강제 적용", observe/<이름>.zip.force).
+#   --online   설정된 S3/CloudFront 채널의 최신 업데이트 ZIP을 지금 내려받아 적용한다(자동배포 설정과 무관).
 # 종료 코드: 0 적용 완료, 75 실행 중 Task 때문에 대기(ZIP을 두고 나중에 다시), 1 실패(바꾼 것은 되돌림), 2 사용법 오류.
 #
 # 순서(Muscat muscat-update.sh의 검증 → 스왑 → 재시작 → 롤백 흐름을 따른다):
@@ -26,19 +27,26 @@ load_acs_env
 
 INSTALL_MODE=0
 FORCE_MODE=0
+ONLINE_MODE=0
 PACKAGE_PATH=""
+ONLINE_PACKAGE_PATH=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --install) INSTALL_MODE=1 ;;
     --force) FORCE_MODE=1 ;;
+    --online) ONLINE_MODE=1 ;;
     -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
     -*) echo "알 수 없는 옵션: $1" >&2; exit 2 ;;
     *) PACKAGE_PATH="$1" ;;
   esac
   shift
 done
-[ -n "$PACKAGE_PATH" ] && [ -f "$PACKAGE_PATH" ] || { echo "사용법: $(basename "$0") [--install] [--force] <acs-<버전>.zip>" >&2; exit 2; }
-PACKAGE_PATH="$(cd "$(dirname "$PACKAGE_PATH")" && pwd)/$(basename "$PACKAGE_PATH")"
+[ "$ONLINE_MODE" -eq 0 ] || [ "$INSTALL_MODE" -eq 0 ] || { echo "--install과 --online은 함께 쓸 수 없습니다." >&2; exit 2; }
+[ "$ONLINE_MODE" -eq 0 ] || [ -z "$PACKAGE_PATH" ] || { echo "--online에는 로컬 ZIP을 함께 지정할 수 없습니다." >&2; exit 2; }
+if [ "$ONLINE_MODE" -eq 0 ]; then
+  [ -n "$PACKAGE_PATH" ] && [ -f "$PACKAGE_PATH" ] || { echo "사용법: $(basename "$0") [--install] [--force] <acs-<버전>.zip> | $(basename "$0") [--force] --online" >&2; exit 2; }
+  PACKAGE_PATH="$(cd "$(dirname "$PACKAGE_PATH")" && pwd)/$(basename "$PACKAGE_PATH")"
+fi
 
 mkdir -p "$DEPLOY_DIR" "$OBSERVE_DIR" "$ACS_ROOT/services" "$ACS_ROOT/backups"
 # 로그가 끝없이 커지지 않게 2MB를 넘으면 마지막 2000줄만 남긴다.
@@ -54,6 +62,44 @@ if ! flock -n 9; then
   exit 75
 fi
 
+download_online_release() {
+  local manifest_path="$DEPLOY_DIR/.manual-online-latest.json"
+  local relative_path expected_sha actual_sha
+  [ -n "$ACS_RELEASE_BASE_URL" ] || { log "온라인 배포 주소가 설정되지 않았습니다."; return 1; }
+  log "온라인 최신 릴리즈 확인: $ACS_RELEASE_BASE_URL/latest.json"
+  curl -fsS --max-time 15 -H "Cache-Control: no-cache" -o "$manifest_path" \
+    "$ACS_RELEASE_BASE_URL/latest.json" || { log "latest.json을 받지 못했습니다."; return 1; }
+  [ "$(release_tool json-get "$manifest_path" kind)" = "acs.online-release" ] \
+    || { log "온라인 매니페스트 형식이 올바르지 않습니다."; rm -f "$manifest_path"; return 1; }
+  relative_path="$(release_tool json-get "$manifest_path" update.path)"
+  expected_sha="$(release_tool json-get "$manifest_path" update.sha256)"
+  case "$relative_path" in
+    ""|/*|*".."*) log "온라인 업데이트 경로가 올바르지 않습니다."; rm -f "$manifest_path"; return 1 ;;
+  esac
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || { log "온라인 업데이트 sha256이 올바르지 않습니다."; rm -f "$manifest_path"; return 1; }
+  ONLINE_PACKAGE_PATH="$DEPLOY_DIR/.manual-online-update.zip"
+  if ! curl -fsS --max-time 1800 -o "$ONLINE_PACKAGE_PATH" "$ACS_RELEASE_BASE_URL/$relative_path"; then
+    log "온라인 업데이트 ZIP을 받지 못했습니다."
+    rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"
+    return 1
+  fi
+  actual_sha="$(sha256sum "$ONLINE_PACKAGE_PATH" | cut -d' ' -f1)"
+  rm -f "$manifest_path"
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    log "온라인 업데이트 sha256이 맞지 않습니다."
+    rm -f "$ONLINE_PACKAGE_PATH"
+    return 1
+  fi
+  PACKAGE_PATH="$ONLINE_PACKAGE_PATH"
+  CURRENT_PACKAGE="$(basename "$relative_path")"
+  log "온라인 업데이트 다운로드 완료: $CURRENT_PACKAGE"
+}
+
+if [ "$ONLINE_MODE" -eq 1 ]; then
+  download_online_release || exit 1
+fi
+
 # observer는 복사본으로 적용하므로 원래 ZIP 이름을 CURRENT_PACKAGE로 넘긴다.
 CURRENT_PACKAGE="${CURRENT_PACKAGE:-$(basename "$PACKAGE_PATH")}"
 CURRENT_VERSION=""
@@ -67,12 +113,17 @@ cleanup_staging() {
   rm -rf "$STAGING_DIR" "$STAGING_DIR.err"
 }
 
+cleanup_online_package() {
+  [ -n "$ONLINE_PACKAGE_PATH" ] && rm -f "$ONLINE_PACKAGE_PATH"
+}
+
 # 아직 아무것도 바꾸지 않은 단계의 실패. 이력만 남기고 끝낸다.
 fail_without_changes() {  # <message>
   log "❌ $1"
   write_status failed "$CURRENT_STAGE" "$1"
   [ -f "$STAGING_DIR/version.json" ] && release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "" failed "$1" || true
   cleanup_staging
+  cleanup_online_package
   exit 1
 }
 
@@ -90,6 +141,7 @@ fail_with_rollback() {  # <message>
   write_status failed rollback "$failure_message. $rollback_result"
   release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "" failed "$failure_message. $rollback_result" || true
   cleanup_staging
+  cleanup_online_package
   exit 1
 }
 
@@ -303,5 +355,6 @@ CURRENT_STAGE="done"
 release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "$IMAGE_TAG" success "" || true
 write_status success done "$CURRENT_VERSION 적용 완료(서비스: ${UPDATED_SERVICES[*]:-없음})"
 cleanup_staging
+cleanup_online_package
 log "✅ $CURRENT_VERSION 적용 완료"
 exit 0

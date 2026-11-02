@@ -279,21 +279,30 @@ export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v6-task-update.zip"
 export FAKE_ONLINE_MANIFEST="$TEST_ROOT/latest.json"
 online_sha="$(sha256sum "$FAKE_ONLINE_PACKAGE" | cut -d' ' -f1)"
 cat > "$FAKE_ONLINE_MANIFEST" <<EOF
-{"kind":"acs.online-release","format_version":1,"version":"6.0.0","update":{"path":"6.0.0/acs-v6-task-update.zip","sha256":"$online_sha"}}
+{"kind":"acs.online-release","format_version":1,"version":"6.0.0","update":{"path":"update/6.0.0/acs-v6-task-update.zip","sha256":"$online_sha"}}
 EOF
 : > "$FAKE_LOG"
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "기본 설정에서는 latest.json을 조회하지 않음" bash -c "! grep -q 'latest.json' '$FAKE_LOG'"
 assert_true "기본 설정에서는 온라인 버전을 적용하지 않음" grep -q "task v5" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_equal "자동배포가 꺼져 있어도 --online 수동 적용" "0" "$(run_update --online)"
+assert_true "수동 온라인 새 버전 적용" grep -q "task 6.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
+
+make_release "$TEST_ROOT/acs-v7-task-update.zip" 7.0.0 task -
+export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v7-task-update.zip"
+online_sha="$(sha256sum "$FAKE_ONLINE_PACKAGE" | cut -d' ' -f1)"
+cat > "$FAKE_ONLINE_MANIFEST" <<EOF
+{"kind":"acs.online-release","format_version":1,"version":"7.0.0","update":{"path":"update/7.0.0/acs-v7-task-update.zip","sha256":"$online_sha"}}
+EOF
 cat >> "$ACS_ENV_FILE" <<EOF
 ACS_ONLINE_AUTO_UPDATE="1"
 ACS_RELEASE_BASE_URL="https://download.example/acs/releases"
 EOF
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "온라인 latest.json 조회" grep -q "latest.json" "$FAKE_LOG"
-assert_true "온라인 ZIP 다운로드" grep -q "acs-v6-task-update.zip" "$FAKE_LOG"
-assert_true "온라인 새 버전 적용" grep -q "task 6.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
-assert_equal "온라인 적용 버전 기록" "6.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+assert_true "온라인 ZIP 다운로드" grep -q "acs-v7-task-update.zip" "$FAKE_LOG"
+assert_true "온라인 새 버전 적용" grep -q "task 7.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_equal "온라인 적용 버전 기록" "7.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
