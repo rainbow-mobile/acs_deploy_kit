@@ -53,6 +53,15 @@ release_tool() {
   python3 -I "$RELEASE_TOOL" "$@"
 }
 
+# curl이 있으면 사용하고, 최소 설치 현장에서는 Python 표준 라이브러리로 내려받는다.
+download_file() {  # <url> <output> <timeout_sec>
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time "$3" -H "Cache-Control: no-cache" -o "$2" "$1"
+  else
+    release_tool download "$1" "$2" "$3"
+  fi
+}
+
 # 설치 디렉터리에서 ACS compose를 실행한다. 현장 덮어쓰기 compose.site.yml(포트 변경 등)이 있으면 마지막에 얹는다.
 # --env-file을 하나라도 주면 .env를 자동으로 읽지 않으므로 .env와 site.env를 모두 적는다.
 acs_compose() {

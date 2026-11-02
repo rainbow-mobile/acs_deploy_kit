@@ -30,6 +30,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 # 릴리즈 매니페스트 종류와 지원 형식 버전입니다(rb_acs scripts/deployment/build_release.py).
 RELEASE_KIND = "acs.release"
@@ -131,6 +132,27 @@ def version_is_newer(candidate: str, installed: str) -> None:
         print("false")
         return
     print("true" if candidate_numbers > installed_numbers else "false")
+
+
+def download(url: str, output_name: str, timeout_text: str) -> None:
+    """curl이 없는 현장에서도 HTTP(S) 파일을 내려받습니다.
+
+    Args:
+        url (str): 다운로드 URL입니다.
+        output_name (str): 저장할 파일 경로입니다.
+        timeout_text (str): 요청 제한 시간(초)입니다.
+    """
+    request = Request(url, headers={"User-Agent": "RB-ACS-Deploy/1", "Cache-Control": "no-cache"})
+    output_path = Path(output_name)
+    partial_path = output_path.with_name(f".{output_path.name}.part")
+    try:
+        with urlopen(request, timeout=int(timeout_text)) as response, partial_path.open("wb") as output_file:
+            while chunk := response.read(4 * 1024 * 1024):
+                output_file.write(chunk)
+        os.replace(partial_path, output_path)
+    except (OSError, ValueError) as error:
+        partial_path.unlink(missing_ok=True)
+        fail(f"다운로드 실패: {error}")
 
 
 def extract(archive_name: str, staging_name: str) -> None:
@@ -460,6 +482,8 @@ def main(arguments: list[str]) -> None:
         json_get(*command_arguments)
     elif command_name == "version-is-newer" and len(command_arguments) == 2:
         version_is_newer(*command_arguments)
+    elif command_name == "download" and len(command_arguments) == 3:
+        download(*command_arguments)
     else:
         fail(f"알 수 없는 명령이거나 인자 수가 다릅니다: {' '.join(arguments)}")
 

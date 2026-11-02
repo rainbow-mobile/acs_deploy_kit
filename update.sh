@@ -67,8 +67,8 @@ download_online_release() {
   local relative_path expected_sha actual_sha
   [ -n "$ACS_RELEASE_BASE_URL" ] || { log "온라인 배포 주소가 설정되지 않았습니다."; return 1; }
   log "온라인 최신 릴리즈 확인: $ACS_RELEASE_BASE_URL/latest.json"
-  curl -fsS --max-time 15 -H "Cache-Control: no-cache" -o "$manifest_path" \
-    "$ACS_RELEASE_BASE_URL/latest.json" || { log "latest.json을 받지 못했습니다."; return 1; }
+  download_file "$ACS_RELEASE_BASE_URL/latest.json" "$manifest_path" 15 \
+    || { log "latest.json을 받지 못했습니다."; return 1; }
   [ "$(release_tool json-get "$manifest_path" kind)" = "acs.online-release" ] \
     || { log "온라인 매니페스트 형식이 올바르지 않습니다."; rm -f "$manifest_path"; return 1; }
   relative_path="$(release_tool json-get "$manifest_path" update.path)"
@@ -79,7 +79,7 @@ download_online_release() {
   [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] \
     || { log "온라인 업데이트 sha256이 올바르지 않습니다."; rm -f "$manifest_path"; return 1; }
   ONLINE_PACKAGE_PATH="$DEPLOY_DIR/.manual-online-update.zip"
-  if ! curl -fsS --max-time 1800 -o "$ONLINE_PACKAGE_PATH" "$ACS_RELEASE_BASE_URL/$relative_path"; then
+  if ! download_file "$ACS_RELEASE_BASE_URL/$relative_path" "$ONLINE_PACKAGE_PATH" 1800; then
     log "온라인 업데이트 ZIP을 받지 못했습니다."
     rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"
     return 1

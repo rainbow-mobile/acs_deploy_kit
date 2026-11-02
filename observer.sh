@@ -41,8 +41,7 @@ download_online_package() {
   local manifest_path="$DEPLOY_DIR/.online-latest.json"
   local partial_path="$OBSERVE_DIR/.online-update.part"
   local online_version installed_version relative_path expected_sha actual_sha package_name
-  curl -fsS --max-time 15 -H "Cache-Control: no-cache" -o "$manifest_path" \
-    "$ACS_RELEASE_BASE_URL/latest.json" 2>/dev/null || return 1
+  download_file "$ACS_RELEASE_BASE_URL/latest.json" "$manifest_path" 15 2>/dev/null || return 1
   [ "$(release_tool json-get "$manifest_path" kind)" = "acs.online-release" ] || { rm -f "$manifest_path"; return 1; }
   online_version="$(release_tool json-get "$manifest_path" version)"
   installed_version="$(release_tool installed-get "$INSTALLED_FILE" version)"
@@ -58,7 +57,7 @@ download_online_package() {
   package_name="$(basename "$relative_path")"
   log "🌐 온라인 새 버전 감지: $installed_version → $online_version"
   write_status downloading online "온라인 업데이트를 다운로드하는 중" "$package_name" "$online_version"
-  if ! curl -fsS --max-time 1800 -o "$partial_path" "$ACS_RELEASE_BASE_URL/$relative_path"; then
+  if ! download_file "$ACS_RELEASE_BASE_URL/$relative_path" "$partial_path" 1800; then
     log "⚠️  온라인 업데이트 다운로드 실패: $relative_path"
     rm -f "$manifest_path" "$partial_path"
     return 1
