@@ -6,7 +6,7 @@
 # - inotifywait가 있으면 ZIP이 놓이는 즉시(close_write·moved_to) 깨어나고, 없으면 CHECK_INTERVAL_SEC마다 확인한다.
 # - 매 주기 observer.json heartbeat를 써서 버전 탭이 observer 동작 여부를 보여 준다.
 # - 적용 결과: 0이면 ZIP 삭제, 75(실행 중 Task 대기)면 ZIP을 두고 다음 주기에 다시, 그 밖은 deploy/failed/로 옮겨 반복 적용을 막는다.
-# Muscat muscat-version-observer.sh의 오프라인 drop 디렉터리 감시와 같은 구조다(온라인 매니페스트 확인은 없다).
+# 로컬 ZIP을 우선하고, ACS_ONLINE_AUTO_UPDATE=1인 현장만 S3/CloudFront의 latest.json도 확인한다.
 
 set -uo pipefail
 
@@ -30,6 +30,49 @@ WAITING_PACKAGE=""
 # 가장 최근 ZIP. Common이 받는 중인 파일(.<이름>.part)은 .zip이 아니라 고르지 않는다.
 latest_package() {
   find "$OBSERVE_DIR" -maxdepth 1 -type f -name '*.zip' ! -name '.*' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-
+}
+
+# 온라인 최신 버전을 확인해 검증된 ZIP만 observe/에 넣는다. 기본 설정에서는 이 함수를 호출해도 네트워크를 쓰지 않는다.
+download_online_package() {
+  [ "$ACS_ONLINE_AUTO_UPDATE" = "1" ] || return 1
+  [ -n "$ACS_RELEASE_BASE_URL" ] || return 1
+  [ -z "$(latest_package)" ] || return 1
+
+  local manifest_path="$DEPLOY_DIR/.online-latest.json"
+  local partial_path="$OBSERVE_DIR/.online-update.part"
+  local online_version installed_version relative_path expected_sha actual_sha package_name
+  curl -fsS --max-time 15 -H "Cache-Control: no-cache" -o "$manifest_path" \
+    "$ACS_RELEASE_BASE_URL/latest.json" 2>/dev/null || return 1
+  [ "$(release_tool json-get "$manifest_path" kind)" = "acs.online-release" ] || { rm -f "$manifest_path"; return 1; }
+  online_version="$(release_tool json-get "$manifest_path" version)"
+  installed_version="$(release_tool installed-get "$INSTALLED_FILE" version)"
+  [ "$(release_tool version-is-newer "$online_version" "$installed_version")" = "true" ] \
+    || { rm -f "$manifest_path"; return 1; }
+  relative_path="$(release_tool json-get "$manifest_path" update.path)"
+  expected_sha="$(release_tool json-get "$manifest_path" update.sha256)"
+  case "$relative_path" in
+    ""|/*|*".."*) rm -f "$manifest_path"; return 1 ;;
+  esac
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || { rm -f "$manifest_path"; return 1; }
+
+  package_name="$(basename "$relative_path")"
+  log "🌐 온라인 새 버전 감지: $installed_version → $online_version"
+  write_status downloading online "온라인 업데이트를 다운로드하는 중" "$package_name" "$online_version"
+  if ! curl -fsS --max-time 1800 -o "$partial_path" "$ACS_RELEASE_BASE_URL/$relative_path"; then
+    log "⚠️  온라인 업데이트 다운로드 실패: $relative_path"
+    rm -f "$manifest_path" "$partial_path"
+    return 1
+  fi
+  actual_sha="$(sha256sum "$partial_path" | cut -d' ' -f1)"
+  if [ "$actual_sha" != "$expected_sha" ]; then
+    log "❌ 온라인 업데이트 sha256 불일치: $package_name"
+    write_status failed online "온라인 업데이트 sha256이 맞지 않습니다" "$package_name" "$online_version"
+    rm -f "$manifest_path" "$partial_path"
+    return 1
+  fi
+  mv -f "$partial_path" "$OBSERVE_DIR/$package_name"
+  rm -f "$manifest_path"
+  log "📥 온라인 업데이트 다운로드 완료: $package_name"
 }
 
 apply_pending_package() {
@@ -93,8 +136,13 @@ wait_for_next_check() {
 
 log "👀 ACS observer 시작: $OBSERVE_DIR (주기 ${CHECK_INTERVAL_SEC}초, inotify $(command -v inotifywait >/dev/null 2>&1 && echo 사용 || echo 없음))"
 while :; do
+  # 설정 파일만 바꾸고 서비스를 재시작하지 않아도 다음 주기에 on/off와 URL이 반영된다.
+  load_acs_env
   write_heartbeat
   apply_pending_package
+  if download_online_package; then
+    apply_pending_package
+  fi
   [ "$RUN_ONCE" -eq 1 ] && break
   wait_for_next_check
 done

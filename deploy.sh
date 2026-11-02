@@ -10,6 +10,9 @@
 #   --frs-url=<주소>         site.env를 새로 만들 때 넣을 FRS REST 주소(http://host:port)
 #   --moms-url=<주소>        site.env를 새로 만들 때 넣을 SMC MOMS 주소
 #   --site-compose=<파일>    현장 compose 덮어쓰기(compose.site.yml, 포트 변경 등). 업데이트해도 바뀌지 않는다
+#   --online-url=<주소>      latest.json이 있는 S3/CloudFront 공개 URL
+#   --auto-update            온라인 최신 릴리즈 자동 적용(기본값: 사용 안 함)
+#   --no-auto-update         온라인 자동 적용 끄기(기존 설정도 해제)
 #   --no-systemd             observer systemd 등록과 docker 부팅 자동 시작을 건너뛴다(시험용, sudo 없는 PC)
 #
 # 하는 일(Muscat muscat-deploy.sh 순서를 따른다):
@@ -28,6 +31,8 @@ PACKAGE_PATH=""
 OPTION_ROOT=""
 OPTION_PROJECT=""
 OPTION_GATEWAY_URL=""
+OPTION_ONLINE_URL=""
+OPTION_AUTO_UPDATE=""
 SITE_ENV_SOURCE=""
 SITE_COMPOSE_SOURCE=""
 FRS_URL=""
@@ -42,6 +47,9 @@ while [ $# -gt 0 ]; do
     --root=*) OPTION_ROOT="${1#*=}" ;;
     --project=*) OPTION_PROJECT="${1#*=}" ;;
     --gateway-url=*) OPTION_GATEWAY_URL="${1#*=}" ;;
+    --online-url=*) OPTION_ONLINE_URL="${1#*=}" ;;
+    --auto-update) OPTION_AUTO_UPDATE=1 ;;
+    --no-auto-update) OPTION_AUTO_UPDATE=0 ;;
     --site-env=*) SITE_ENV_SOURCE="${1#*=}" ;;
     --site-compose=*) SITE_COMPOSE_SOURCE="${1#*=}" ;;
     --frs-url=*) FRS_URL="${1#*=}" ;;
@@ -61,6 +69,13 @@ load_acs_env
 ACS_ROOT="${OPTION_ROOT:-$ACS_ROOT}"
 ACS_PROJECT="${OPTION_PROJECT:-$ACS_PROJECT}"
 ACS_GATEWAY_URL="${OPTION_GATEWAY_URL:-$ACS_GATEWAY_URL}"
+ACS_RELEASE_BASE_URL="${OPTION_ONLINE_URL:-$ACS_RELEASE_BASE_URL}"
+ACS_RELEASE_BASE_URL="${ACS_RELEASE_BASE_URL%/}"
+ACS_ONLINE_AUTO_UPDATE="${OPTION_AUTO_UPDATE:-$ACS_ONLINE_AUTO_UPDATE}"
+if [ "$ACS_ONLINE_AUTO_UPDATE" = "1" ] && [ -z "$ACS_RELEASE_BASE_URL" ]; then
+  echo "❌ --auto-update에는 --online-url=<S3/CloudFront URL>이 필요합니다." >&2
+  exit 2
+fi
 mkdir -p "$ACS_ROOT"
 ACS_ROOT="$(cd "$ACS_ROOT" && pwd)"
 
@@ -117,7 +132,7 @@ ensure_docker_permission() {
 ensure_docker
 check_compose_version
 ensure_docker_permission
-for required_command in python3 curl flock; do
+for required_command in python3 curl flock sha256sum; do
   command -v "$required_command" >/dev/null 2>&1 || { echo "❌ 필수 명령이 없습니다: $required_command" >&2; exit 1; }
 done
 if ! command -v inotifywait >/dev/null 2>&1; then
@@ -138,6 +153,9 @@ ACS_ROOT="$ACS_ROOT"
 ACS_PROJECT="$ACS_PROJECT"
 # 호스트에서 Gateway 주소. 업데이트 전 실행 중 Task 확인에 쓴다
 ACS_GATEWAY_URL="$ACS_GATEWAY_URL"
+# 온라인 자동배포. 기본은 0이며 1일 때만 observer가 네트워크를 조회한다
+ACS_ONLINE_AUTO_UPDATE="$ACS_ONLINE_AUTO_UPDATE"
+ACS_RELEASE_BASE_URL="$ACS_RELEASE_BASE_URL"
 EOF
 )"
   mkdir -p "$(dirname "$ACS_ENV_FILE")" 2>/dev/null || true
@@ -205,4 +223,5 @@ echo "║   RB ACS 설치 완료 ✅            ║"
 echo "╚══════════════════════════════════╝"
 echo "  버전: $(release_tool installed-get "$INSTALLED_FILE" version)"
 echo "  Debugger: $ACS_GATEWAY_URL/state/debugger/  (버전 탭에서 업데이트 ZIP 업로드)"
+echo "  온라인 자동배포: $([ "$ACS_ONLINE_AUTO_UPDATE" = "1" ] && echo 사용 || echo 사용 안 함)"
 echo "  상태 파일: $STATUS_FILE"

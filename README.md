@@ -39,9 +39,24 @@ tests/
 | `--gateway-url=<주소>` | `http://127.0.0.1:13000` | 실행 중 Task 확인 주소 |
 | `--site-env=<파일>` | 없음 | 기존 현장 설정 복사 |
 | `--site-compose=<파일>` | 없음 | 현장 compose 덮어쓰기 |
+| `--online-url=<주소>` | 없음 | `latest.json`이 있는 S3/CloudFront 공개 URL |
+| `--auto-update` | 사용 안 함 | 온라인 최신 버전 자동 적용 활성화 |
+| `--no-auto-update` | 기본값 | 기존 온라인 자동 적용 설정도 해제 |
 | `--no-systemd` | 등록함 | 시험용으로 observer 등록 생략 |
 
 사용자 홈은 코드에 고정하지 않습니다. 기본 설치 위치는 키트 위치를 기준으로 계산하고 `--root`로 바꿀 수 있습니다.
+
+온라인 자동배포는 기본적으로 꺼져 있습니다. 활성화할 현장에서만 다음처럼 설치합니다.
+
+```bash
+./deploy.sh acs-v1.2.3-install.zip \
+  --online-url=https://배포도메인/acs/releases \
+  --auto-update
+```
+
+observer는 로컬로 업로드된 ZIP을 항상 먼저 처리합니다. 로컬 ZIP이 없고 자동배포가 켜진 경우에만
+`latest.json`을 조회하며, 현재보다 높은 버전의 업데이트 ZIP을 내려받아 SHA-256 검증 후 기존 `update.sh`로 적용합니다.
+설치 후 `/etc/rainbow/acs-env.conf`에서 `ACS_ONLINE_AUTO_UPDATE=0`으로 바꾸면 다음 확인 주기부터 온라인 조회가 중단됩니다.
 
 ## 업데이트와 롤백
 

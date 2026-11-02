@@ -19,6 +19,11 @@ load_acs_env() {
   ACS_PROJECT="${ACS_PROJECT:-rb-acs}"
   # 실행 중 Task 확인에 쓰는 Gateway 주소(호스트에서 접속).
   ACS_GATEWAY_URL="${ACS_GATEWAY_URL:-http://127.0.0.1:13000}"
+  # 온라인 자동배포는 명시적으로 1을 설정한 현장만 사용한다.
+  ACS_ONLINE_AUTO_UPDATE="${ACS_ONLINE_AUTO_UPDATE:-0}"
+  # rb_acs가 latest.json을 올린 S3/CloudFront 공개 URL(prefix 루트).
+  ACS_RELEASE_BASE_URL="${ACS_RELEASE_BASE_URL:-}"
+  ACS_RELEASE_BASE_URL="${ACS_RELEASE_BASE_URL%/}"
   # observer 확인 주기(초). 업로드 ZIP은 inotify로 바로 감지하고, 없으면 이 주기로 확인한다.
   CHECK_INTERVAL_SEC="${CHECK_INTERVAL_SEC:-5}"
   # 업데이트 후 서비스가 healthy가 되기를 기다리는 최대 시간(초).

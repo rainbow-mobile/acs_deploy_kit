@@ -49,11 +49,24 @@ EOF
 # ── 가짜 curl: FAKE_STATE_DIR/executions.json이 있으면 Task 실행 목록으로 답하고, 없으면 Task 서비스가 응답하지 않는 것처럼 실패 ──
 cat > "$FAKE_BIN_DIR/curl" <<'EOF'
 #!/bin/bash
+echo "curl $*" >> "$FAKE_LOG"
+output_path=""
+request_url=""
+previous=""
 for argument in "$@"; do
+  [ "$previous" = "-o" ] && output_path="$argument"
+  previous="$argument"
   case "$argument" in
     *download.docker.com*) exit 7 ;;
+    http://*|https://*) request_url="$argument" ;;
   esac
 done
+if [[ "$request_url" == */latest.json ]] && [ -n "${FAKE_ONLINE_MANIFEST:-}" ]; then
+  cp "$FAKE_ONLINE_MANIFEST" "$output_path"; exit 0
+fi
+if [[ "$request_url" == */acs-*-update.zip ]] && [ -n "${FAKE_ONLINE_PACKAGE:-}" ]; then
+  cp "$FAKE_ONLINE_PACKAGE" "$output_path"; exit 0
+fi
 [ -f "$FAKE_STATE_DIR/executions.json" ] && { cat "$FAKE_STATE_DIR/executions.json"; exit 0; }
 exit 7
 EOF
@@ -150,6 +163,7 @@ assert_true "이미지 load" grep -q "docker load -i" "$FAKE_LOG"
 assert_true "최초 설치는 DB 백업을 하지 않음" bash -c "! grep -q mongodump '$FAKE_LOG'"
 assert_true "최초 설치는 compose up이 만든 컨테이너를 다시 재시작하지 않음" bash -c "! grep -q ' restart ' '$FAKE_LOG'"
 assert_true "최초 설치는 이전 버전 보관본이 없음" bash -c "! ls '$ACS_ROOT'/deploy/archives/*.zip >/dev/null 2>&1"
+assert_equal "온라인 자동배포 기본값은 꺼짐" "0" "$(bash -c '. "$1"; echo "$ACS_ONLINE_AUTO_UPDATE"' _ "$ACS_ENV_FILE")"
 
 echo "▶ 현장 파일은 업데이트가 덮어쓰지 않음 + Task만 바꾸는 부분 업데이트"
 echo "listen 13105; # 현장 수정" > "$ACS_ROOT/api-gateway/servers/smc.conf"
@@ -256,6 +270,28 @@ bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "실패 ZIP은 failed/로" test -f "$ACS_ROOT/deploy/failed/acs-v3-broken.zip"
 assert_true "실패 ZIP은 observe/에서 빠짐" test ! -e "$ACS_ROOT/deploy/observe/acs-v3-broken.zip"
 assert_equal "status의 ZIP 이름은 원래 이름" "acs-v3-broken.zip" "$(json_value "$ACS_ROOT/deploy/status.json" package)"
+
+echo "▶ 온라인 자동배포: 기본은 조회하지 않고, 명시적으로 켜면 새 버전만 검증 후 적용"
+make_release "$TEST_ROOT/acs-v6-task-update.zip" 6.0.0 task -
+export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v6-task-update.zip"
+export FAKE_ONLINE_MANIFEST="$TEST_ROOT/latest.json"
+online_sha="$(sha256sum "$FAKE_ONLINE_PACKAGE" | cut -d' ' -f1)"
+cat > "$FAKE_ONLINE_MANIFEST" <<EOF
+{"kind":"acs.online-release","format_version":1,"version":"6.0.0","update":{"path":"6.0.0/acs-v6-task-update.zip","sha256":"$online_sha"}}
+EOF
+: > "$FAKE_LOG"
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "기본 설정에서는 latest.json을 조회하지 않음" bash -c "! grep -q 'latest.json' '$FAKE_LOG'"
+assert_true "기본 설정에서는 온라인 버전을 적용하지 않음" grep -q "task v5" "$ACS_ROOT/services/task/task.amd64.bin"
+cat >> "$ACS_ENV_FILE" <<EOF
+ACS_ONLINE_AUTO_UPDATE="1"
+ACS_RELEASE_BASE_URL="https://download.example/acs/releases"
+EOF
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "온라인 latest.json 조회" grep -q "latest.json" "$FAKE_LOG"
+assert_true "온라인 ZIP 다운로드" grep -q "acs-v6-task-update.zip" "$FAKE_LOG"
+assert_true "온라인 새 버전 적용" grep -q "task 6.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_equal "온라인 적용 버전 기록" "6.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

@@ -97,6 +97,42 @@ def file_sha256(file_path: Path) -> str:
     return file_hash.hexdigest()
 
 
+def json_get(file_name: str, key_path: str) -> None:
+    """JSON 문서의 점 구분 경로 값을 출력합니다.
+
+    Args:
+        file_name (str): JSON 파일 경로입니다.
+        key_path (str): 예: update.path 형태의 키 경로입니다.
+    """
+    value: object = read_json(Path(file_name))
+    for key_name in key_path.split("."):
+        value = value.get(key_name) if isinstance(value, dict) else None
+    print("" if value is None else value)
+
+
+def version_is_newer(candidate: str, installed: str) -> None:
+    """candidate가 설치 버전보다 높은 세 자리 숫자 버전인지 출력합니다.
+
+    Args:
+        candidate (str): 온라인 후보 버전입니다.
+        installed (str): 현재 설치 버전입니다.
+    """
+    version_pattern = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
+
+    def version_numbers(version: str) -> tuple[int, int, int] | None:
+        version_match = version_pattern.fullmatch(version)
+        if not version_match:
+            return None
+        return tuple(int(number or 0) for number in version_match.groups())
+
+    candidate_numbers = version_numbers(candidate)
+    installed_numbers = version_numbers(installed)
+    if candidate_numbers is None or installed_numbers is None:
+        print("false")
+        return
+    print("true" if candidate_numbers > installed_numbers else "false")
+
+
 def extract(archive_name: str, staging_name: str) -> None:
     """ZIP을 staging 디렉터리에 풉니다. 절대 경로·`..`로 staging 밖에 쓰려는 항목이 있으면 거절합니다.
 
@@ -420,6 +456,10 @@ def main(arguments: list[str]) -> None:
         make_site_env(*command_arguments)
     elif command_name == "snapshot" and len(command_arguments) == 5:
         snapshot(*command_arguments)
+    elif command_name == "json-get" and len(command_arguments) == 2:
+        json_get(*command_arguments)
+    elif command_name == "version-is-newer" and len(command_arguments) == 2:
+        version_is_newer(*command_arguments)
     else:
         fail(f"알 수 없는 명령이거나 인자 수가 다릅니다: {' '.join(arguments)}")
 
