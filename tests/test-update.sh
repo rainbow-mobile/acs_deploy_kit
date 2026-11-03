@@ -37,7 +37,8 @@ if [ "${1:-}" = "compose" ]; then
   esac
 fi
 case "${1:-}" in
-  info) exit 0 ;;
+  # docker-needs-group가 있으면 docker 그룹을 받은 다시 실행(sg) 전까지 권한이 없는 것처럼 실패한다.
+  info) [ -f "$FAKE_STATE_DIR/docker-needs-group" ] && [ "${ACS_DEPLOY_DOCKER_GROUP_REEXEC:-0}" != "1" ] && exit 1; exit 0 ;;
   load) exit 0 ;;
   image) [ -f "$FAKE_STATE_DIR/missing-image" ] && grep -qx "$3" "$FAKE_STATE_DIR/missing-image" && exit 1; exit 0 ;;
   inspect)
@@ -322,6 +323,34 @@ assert_true "--mode=develop은 develop 채널 latest.json" grep -q "acs/develop/
 assert_equal "--mode 채널 기록" "develop" "$(bash -c '. "$1"; echo "$ACS_RELEASE_CHANNEL"' _ "$online_install_env")"
 bash "$KIT_DIR/deploy.sh" "$TEST_ROOT/acs-v1.zip" --no-systemd >/dev/null 2>&1
 assert_equal "위치 인자 ZIP은 --input 안내 후 거절" "2" "$?"
+
+echo "▶ deploy.sh: docker 권한이 없으면 그룹에 추가하고 sg로 다시 실행해 재로그인 없이 설치"
+group_bin_dir="$TEST_ROOT/fake-group-bin"
+mkdir -p "$group_bin_dir"
+cat > "$group_bin_dir/sudo" <<'FAKE_SUDO'
+#!/bin/bash
+echo "sudo $*" >> "$FAKE_LOG"
+exit 0
+FAKE_SUDO
+cat > "$group_bin_dir/id" <<'FAKE_ID'
+#!/bin/bash
+echo "acs-user"
+FAKE_ID
+cat > "$group_bin_dir/sg" <<'FAKE_SG'
+#!/bin/bash
+echo "sg $1" >> "$FAKE_LOG"
+exec bash -c "$3"
+FAKE_SG
+chmod +x "$group_bin_dir/sudo" "$group_bin_dir/id" "$group_bin_dir/sg"
+touch "$FAKE_STATE_DIR/docker-needs-group"
+: > "$FAKE_LOG"
+PATH="$group_bin_dir:$PATH" ACS_ENV_FILE="$TEST_ROOT/etc/acs-group-env.conf" bash "$KIT_DIR/deploy.sh" \
+  --input="$TEST_ROOT/acs-v1.zip" --root="$TEST_ROOT/rb-acs-group" --project=rb-acs-group-test --no-systemd >/dev/null 2>&1
+assert_equal "그룹 추가 후 이어서 설치 종료 코드" "0" "$?"
+assert_true "docker 그룹 추가" grep -q "sudo usermod -aG docker" "$FAKE_LOG"
+assert_true "sg docker로 다시 실행" grep -q "sg docker" "$FAKE_LOG"
+assert_true "다시 실행한 쪽이 설치 완료" test -f "$TEST_ROOT/rb-acs-group/deploy/installed.json"
+rm -f "$FAKE_STATE_DIR/docker-needs-group"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

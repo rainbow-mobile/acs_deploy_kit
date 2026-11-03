@@ -55,6 +55,10 @@ ZIP 경로를 옵션 없이 쓰면(`./deploy.sh acs.zip`) `--input=`을 쓰라�
 `--online-channel=<이름>`은 `--mode`와 같습니다. 고른 채널은 `/etc/rainbow/acs-env.conf`의 `ACS_RELEASE_CHANNEL`에 남아
 observer 자동 업데이트와 `update.sh --online`도 같은 채널을 봅니다. 다시 설치할 때 `--mode`를 주지 않으면 기록된 채널을 씁니다.
 
+`deploy.sh`는 큰 ZIP을 받기 전에 사전 환경부터 준비합니다(sudo 비밀번호를 물을 수 있음). Docker·Compose가 없고 인터넷이 되면 apt로
+설치하고(`docker.io`, `docker-compose-v2`, Compose v2.24 이상 필요) 데몬을 켜며, 현재 사용자가 docker를 못 쓰면 docker 그룹에 추가한 뒤
+`sg docker`로 같은 옵션 그대로 다시 실행해 이어서 설치합니다. 다시 로그인하지 않아도 됩니다. `inotify-tools`도 없으면 설치합니다.
+
 사용자 홈은 코드에 고정하지 않습니다. 기본 설치 위치는 키트 위치를 기준으로 계산하고 `--root`로 바꿀 수 있습니다.
 온라인 자동배포는 기본적으로 꺼져 있고 `--auto-update`를 준 현장에서만 켜집니다.
 

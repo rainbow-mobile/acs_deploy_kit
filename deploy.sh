@@ -19,7 +19,8 @@
 #   --no-systemd             observer systemd 등록과 docker 부팅 자동 시작을 건너뛴다(시험용, sudo 없는 PC)
 #
 # 하는 일(Muscat muscat-deploy.sh 순서를 따른다):
-#   1. arch·필수 명령 확인. docker가 없고 인터넷이 되면 apt로 설치를 시도한다
+#   1. 사전 환경: arch 확인, docker가 없고 인터넷이 되면 apt로 설치·데몬 시작, docker 그룹 추가(sg로 다시 실행해 재로그인 불필요),
+#      inotify-tools. 그다음 온라인이면 통합 ZIP을 받는다
 #   2. 설정 파일(/etc/rainbow/acs-env.conf)에 설치 디렉터리·프로젝트·Gateway 주소를 적는다(observer가 root로 읽음)
 #   3. site.env 준비 → update.sh --install로 이미지 load·설정·서비스 bin 배치·compose up·헬스체크
 #   4. docker 부팅 자동 시작(compose restart: unless-stopped로 컨테이너도 함께 뜬다)과 observer systemd 등록
@@ -27,6 +28,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# docker 그룹을 새로 받은 뒤 같은 옵션으로 다시 실행할 때 쓴다(다시 로그인하지 않게).
+ORIGINAL_ARGUMENTS=("$@")
 # shellcheck source=common.sh
 . "$SCRIPT_DIR/common.sh"
 
@@ -125,10 +128,8 @@ download_online_install() {
   echo "📥 온라인 설치 ZIP 다운로드 완료: $(basename "$relative_path")"
 }
 
-if [ -z "$PACKAGE_PATH" ]; then
-  download_online_install || exit 1
-  trap 'rm -f "$ONLINE_PACKAGE_PATH"' EXIT
-else
+# 오프라인 ZIP은 사전 준비(sudo) 전에 있는지부터 확인합니다.
+if [ -n "$PACKAGE_PATH" ]; then
   [ -f "$PACKAGE_PATH" ] || { echo "❌ --input으로 지정한 ZIP이 없습니다: $PACKAGE_PATH" >&2; exit 2; }
   PACKAGE_PATH="$(cd "$(dirname "$PACKAGE_PATH")" && pwd)/$(basename "$PACKAGE_PATH")"
 fi
@@ -137,10 +138,9 @@ echo ""
 echo "╔══════════════════════════════════╗"
 echo "║   RB ACS 설치 시작               ║"
 echo "╚══════════════════════════════════╝"
-echo "📦 릴리즈: $PACKAGE_PATH"
 echo "📁 설치 디렉터리: $ACS_ROOT (프로젝트 $ACS_PROJECT)"
 
-# ── 1. arch·필수 명령 ─────────────────────────────
+# ── 1. 사전 환경(arch·Docker·권한·inotify). 큰 ZIP을 받기 전에 끝냅니다 ──
 if [ "$(host_arch)" != "amd64" ]; then
   echo "❌ 지원하지 않는 아키텍처입니다: $(uname -m). ACS 서비스 bin은 amd64(x86_64)만 있습니다." >&2
   exit 1
@@ -160,8 +160,12 @@ ensure_docker() {
     return 0
   fi
   if command -v apt-get >/dev/null 2>&1 && can_use_network; then
-    echo "🐳 Docker 설치 시도(apt)..."
+    echo "🐳 Docker 설치(apt)..."
     sudo apt-get update -qq && sudo apt-get install -y docker.io docker-compose-v2 >/dev/null || true
+  fi
+  # 설치 직후 데몬이 꺼져 있을 수 있어 부팅 자동 시작과 함께 켭니다.
+  if command -v systemctl >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
+    sudo systemctl enable --now docker >/dev/null 2>&1 || true
   fi
   if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     echo "❌ Docker와 Docker Compose(v2.24 이상)가 필요합니다. 인터넷이 없으면 docker.io·docker-compose-v2 패키지를 미리 설치하세요." >&2
@@ -181,10 +185,24 @@ check_compose_version() {
 
 ensure_docker_permission() {
   docker info >/dev/null 2>&1 && return 0
-  echo "⚠️  현재 사용자($USER)가 docker를 쓸 수 없습니다. docker 그룹에 추가합니다."
-  sudo usermod -aG docker "$USER"
-  echo "❌ 다시 로그인한 뒤 deploy.sh를 다시 실행하세요." >&2
-  exit 1
+  # 데몬이 꺼져 있어서 실패한 것이면 먼저 켭니다.
+  if command -v systemctl >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
+    echo "🐳 Docker 데몬을 시작합니다."
+    sudo systemctl enable --now docker >/dev/null 2>&1 || true
+    docker info >/dev/null 2>&1 && return 0
+  fi
+  if [ "${ACS_DEPLOY_DOCKER_GROUP_REEXEC:-0}" = "1" ]; then
+    echo "❌ docker 그룹을 적용해도 docker를 쓸 수 없습니다. 'sudo docker info'로 Docker 상태를 확인하세요." >&2
+    exit 1
+  fi
+  if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+    echo "🔑 현재 사용자($USER)를 docker 그룹에 추가합니다."
+    sudo usermod -aG docker "$USER"
+  fi
+  # 새 그룹은 다시 로그인해야 적용되므로, sg로 docker 그룹을 단 채 같은 옵션으로 이 스크립트를 다시 실행합니다.
+  echo "🔁 docker 그룹을 적용해 설치를 이어 갑니다(다시 로그인하지 않아도 됩니다)."
+  export ACS_DEPLOY_DOCKER_GROUP_REEXEC=1
+  exec sg docker -c "exec bash $(printf '%q ' "$SCRIPT_DIR/deploy.sh" "${ORIGINAL_ARGUMENTS[@]}")"
 }
 
 ensure_docker
@@ -196,6 +214,12 @@ if ! command -v inotifywait >/dev/null 2>&1; then
   fi
   command -v inotifywait >/dev/null 2>&1 || echo "ℹ️  inotify-tools가 없어 observer가 ${CHECK_INTERVAL_SEC}초마다 확인합니다."
 fi
+
+if [ -z "$PACKAGE_PATH" ]; then
+  download_online_install || exit 1
+  trap 'rm -f "$ONLINE_PACKAGE_PATH"' EXIT
+fi
+echo "📦 릴리즈: $PACKAGE_PATH"
 
 # ── 2. 설정 파일 ──────────────────────────────────
 write_env_file() {
