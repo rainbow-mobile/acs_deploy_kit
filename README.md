@@ -54,6 +54,14 @@ tests/
   --auto-update
 ```
 
+로컬 설치 ZIP 없이 최신 설치용 파일을 온라인으로 받아 설치할 수도 있습니다.
+
+```bash
+./deploy.sh --online
+./deploy.sh --online --online-channel=develop
+./deploy.sh --online --auto-update   # 설치 후 자동 업데이트도 함께 활성화
+```
+
 `develop` 채널을 사용하려면 `--online-channel=develop`을 함께 지정합니다.
 
 observer는 로컬로 업로드된 ZIP을 항상 먼저 처리합니다. 로컬 ZIP이 없고 자동배포가 켜진 경우에만

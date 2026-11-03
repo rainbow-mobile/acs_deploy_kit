@@ -64,7 +64,7 @@ done
 if [[ "$request_url" == */latest.json ]] && [ -n "${FAKE_ONLINE_MANIFEST:-}" ]; then
   cp "$FAKE_ONLINE_MANIFEST" "$output_path"; exit 0
 fi
-if [[ "$request_url" == */acs-*-update.zip ]] && [ -n "${FAKE_ONLINE_PACKAGE:-}" ]; then
+if [[ "$request_url" == */acs-*-update.zip || "$request_url" == */acs-*-install.zip ]] && [ -n "${FAKE_ONLINE_PACKAGE:-}" ]; then
   cp "$FAKE_ONLINE_PACKAGE" "$output_path"; exit 0
 fi
 [ -f "$FAKE_STATE_DIR/executions.json" ] && { cat "$FAKE_STATE_DIR/executions.json"; exit 0; }
@@ -303,6 +303,21 @@ assert_true "온라인 latest.json 조회" grep -q "latest.json" "$FAKE_LOG"
 assert_true "온라인 ZIP 다운로드" grep -q "acs-v7-task-update.zip" "$FAKE_LOG"
 assert_true "온라인 새 버전 적용" grep -q "task 7.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_equal "온라인 적용 버전 기록" "7.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+
+echo "▶ deploy.sh --online: 로컬 ZIP 없이 최신 설치용 ZIP을 받아 최초 설치"
+online_install_root="$TEST_ROOT/rb-acs-online"
+online_install_env="$TEST_ROOT/etc/acs-online-env.conf"
+make_release "$TEST_ROOT/acs-v8-install.zip" 8.0.0 "$ALL_SERVICES" v8
+export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v8-install.zip"
+online_sha="$(sha256sum "$FAKE_ONLINE_PACKAGE" | cut -d' ' -f1)"
+cat > "$FAKE_ONLINE_MANIFEST" <<EOF
+{"kind":"acs.online-release","format_version":1,"version":"8.0.0","deploy":{"path":"deploy/8.0.0/acs-v8-install.zip","sha256":"$online_sha"},"update":{"path":"update/8.0.0/acs-v8-update.zip","sha256":"$online_sha"}}
+EOF
+ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --online --root="$online_install_root" \
+  --project=rb-acs-online-test --frs-url=http://10.0.0.5:3000 --no-systemd >/dev/null 2>&1
+assert_equal "온라인 최초 설치 종료 코드" "0" "$?"
+assert_equal "온라인 최초 설치 버전" "8.0.0" "$(json_value "$online_install_root/deploy/installed.json" version)"
+assert_true "온라인 최초 설치는 install ZIP 다운로드" grep -q "acs-v8-install.zip" "$FAKE_LOG"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

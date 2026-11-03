@@ -1,7 +1,8 @@
 #!/bin/bash
 # deploy.sh — 현장 PC에 ACS를 처음 설치하고, 부팅 때 자동으로 뜨도록 등록한다.
-# 사용법: ./deploy.sh <acs-<버전>.zip> [옵션]
+# 사용법: ./deploy.sh <acs-<버전>.zip> [옵션] | ./deploy.sh --online [옵션]
 #   릴리즈 ZIP은 rb_acs에서 `make backend.deploy`로 만든다(최초 설치는 이미지 포함을 고른 ZIP).
+#   --online                 S3/CloudFront의 최신 설치용 ZIP을 내려받아 최초 설치
 #
 #   --root=<디렉터리>        설치 디렉터리 (기본: 배포 키트 옆 rb-acs, 예: ~/rb-acs)
 #   --project=<이름>         compose 프로젝트 이름 (기본: rb-acs)
@@ -29,6 +30,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/common.sh"
 
 PACKAGE_PATH=""
+ONLINE_INSTALL=0
+ONLINE_PACKAGE_PATH=""
 OPTION_ROOT=""
 OPTION_PROJECT=""
 OPTION_GATEWAY_URL=""
@@ -49,6 +52,7 @@ while [ $# -gt 0 ]; do
     --root=*) OPTION_ROOT="${1#*=}" ;;
     --project=*) OPTION_PROJECT="${1#*=}" ;;
     --gateway-url=*) OPTION_GATEWAY_URL="${1#*=}" ;;
+    --online) ONLINE_INSTALL=1 ;;
     --online-url=*) OPTION_ONLINE_URL="${1#*=}" ;;
     --online-channel=*) OPTION_ONLINE_CHANNEL="${1#*=}" ;;
     --auto-update) OPTION_AUTO_UPDATE=1 ;;
@@ -64,8 +68,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ -n "$PACKAGE_PATH" ] && [ -f "$PACKAGE_PATH" ] || { echo "❌ 릴리즈 ZIP을 지정하세요." >&2; usage; exit 2; }
-PACKAGE_PATH="$(cd "$(dirname "$PACKAGE_PATH")" && pwd)/$(basename "$PACKAGE_PATH")"
+[ "$ONLINE_INSTALL" -eq 0 ] || [ -z "$PACKAGE_PATH" ] || { echo "❌ --online에는 로컬 ZIP을 함께 지정할 수 없습니다." >&2; exit 2; }
+for required_command in python3 flock sha256sum; do
+  command -v "$required_command" >/dev/null 2>&1 || { echo "❌ 필수 명령이 없습니다: $required_command" >&2; exit 1; }
+done
 
 # 다시 설치할 때는 기존 설정 파일 값을 이어 쓰고, 옵션으로 준 값만 바꾼다.
 load_acs_env
@@ -87,6 +93,40 @@ fi
 mkdir -p "$ACS_ROOT"
 ACS_ROOT="$(cd "$ACS_ROOT" && pwd)"
 
+download_online_install() {
+  local manifest_path expected_sha actual_sha relative_path
+  manifest_path="$(mktemp /tmp/acs-online-latest.XXXXXX.json)"
+  ONLINE_PACKAGE_PATH="$(mktemp /tmp/acs-online-install.XXXXXX.zip)"
+  echo "🌐 온라인 최신 설치 릴리즈 확인: $ACS_RELEASE_BASE_URL/latest.json"
+  download_file "$ACS_RELEASE_BASE_URL/latest.json" "$manifest_path" 15 \
+    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ latest.json을 받지 못했습니다." >&2; return 1; }
+  [ "$(release_tool json-get "$manifest_path" kind)" = "acs.online-release" ] \
+    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 매니페스트 형식이 올바르지 않습니다." >&2; return 1; }
+  relative_path="$(release_tool json-get "$manifest_path" deploy.path)"
+  expected_sha="$(release_tool json-get "$manifest_path" deploy.sha256)"
+  case "$relative_path" in
+    ""|/*|*".."*) rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 경로가 올바르지 않습니다." >&2; return 1 ;;
+  esac
+  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] \
+    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 sha256이 올바르지 않습니다." >&2; return 1; }
+  download_file "$ACS_RELEASE_BASE_URL/$relative_path" "$ONLINE_PACKAGE_PATH" 1800 \
+    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 ZIP을 받지 못했습니다." >&2; return 1; }
+  actual_sha="$(sha256sum "$ONLINE_PACKAGE_PATH" | cut -d' ' -f1)"
+  rm -f "$manifest_path"
+  [ "$actual_sha" = "$expected_sha" ] \
+    || { rm -f "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 ZIP sha256이 맞지 않습니다." >&2; return 1; }
+  PACKAGE_PATH="$ONLINE_PACKAGE_PATH"
+  echo "📥 온라인 설치 ZIP 다운로드 완료: $(basename "$relative_path")"
+}
+
+if [ "$ONLINE_INSTALL" -eq 1 ]; then
+  download_online_install || exit 1
+  trap 'rm -f "$ONLINE_PACKAGE_PATH"' EXIT
+else
+  [ -n "$PACKAGE_PATH" ] && [ -f "$PACKAGE_PATH" ] || { echo "❌ 릴리즈 ZIP을 지정하거나 --online을 사용하세요." >&2; usage; exit 2; }
+  PACKAGE_PATH="$(cd "$(dirname "$PACKAGE_PATH")" && pwd)/$(basename "$PACKAGE_PATH")"
+fi
+
 echo ""
 echo "╔══════════════════════════════════╗"
 echo "║   RB ACS 설치 시작               ║"
@@ -101,7 +141,11 @@ if [ "$(host_arch)" != "amd64" ]; then
 fi
 
 can_use_network() {
-  curl -fsS --max-time 5 -o /dev/null https://download.docker.com 2>/dev/null
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 5 -o /dev/null https://download.docker.com 2>/dev/null
+  else
+    python3 -I -c 'from urllib.request import urlopen; urlopen("https://download.docker.com", timeout=5).close()' 2>/dev/null
+  fi
 }
 
 # Muscat ensure_docker와 같다. 오프라인 현장은 Docker를 미리 설치해 와야 한다.
@@ -140,9 +184,6 @@ ensure_docker_permission() {
 ensure_docker
 check_compose_version
 ensure_docker_permission
-for required_command in python3 curl flock sha256sum; do
-  command -v "$required_command" >/dev/null 2>&1 || { echo "❌ 필수 명령이 없습니다: $required_command" >&2; exit 1; }
-done
 if ! command -v inotifywait >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1 && can_use_network; then
     sudo apt-get install -y inotify-tools >/dev/null 2>&1 || true
