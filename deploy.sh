@@ -1,8 +1,10 @@
 #!/bin/bash
 # deploy.sh — 현장 PC에 ACS를 처음 설치하고, 부팅 때 자동으로 뜨도록 등록한다.
-# 사용법: ./deploy.sh <acs-<버전>.zip> [옵션] | ./deploy.sh --online [옵션]
-#   릴리즈 ZIP은 rb_acs에서 `make backend.deploy`로 만든다(최초 설치는 이미지 포함을 고른 ZIP).
-#   --online                 S3/CloudFront의 최신 설치용 ZIP을 내려받아 최초 설치
+# 사용법: ./deploy.sh [옵션]                       온라인(기본): S3/CloudFront의 최신 통합 ZIP을 내려받아 최초 설치
+#         ./deploy.sh --input=<acs ZIP 경로> [옵션]   오프라인: 가져온 통합 ZIP(이미지 포함)으로 최초 설치
+#   통합 ZIP은 rb_acs의 배포 Action이 `make backend.deploy`의 통합 묶음으로 만든다.
+#   --mode=<채널>            온라인 배포 채널 (기본: main, develop이면 개발 빌드. URL은 .../acs/<채널>)
+#   --input=<파일>           오프라인 설치에 쓸 통합 ZIP. 주면 온라인으로 받지 않는다
 #
 #   --root=<디렉터리>        설치 디렉터리 (기본: 배포 키트 옆 rb-acs, 예: ~/rb-acs)
 #   --project=<이름>         compose 프로젝트 이름 (기본: rb-acs)
@@ -11,8 +13,7 @@
 #   --frs-url=<주소>         site.env를 새로 만들 때 넣을 FRS REST 주소(http://host:port)
 #   --moms-url=<주소>        site.env를 새로 만들 때 넣을 SMC MOMS 주소
 #   --site-compose=<파일>    현장 compose 덮어쓰기(compose.site.yml, 포트 변경 등). 업데이트해도 바뀌지 않는다
-#   --online-url=<주소>      latest.json이 있는 S3/CloudFront 공개 URL
-#   --online-channel=<이름>  온라인 배포 채널 (기본: main, URL은 .../acs/<채널>)
+#   --online-url=<주소>      latest.json이 있는 S3/CloudFront 공개 URL(--mode 대신 직접 지정)
 #   --auto-update            온라인 최신 릴리즈 자동 적용(기본값: 사용 안 함)
 #   --no-auto-update         온라인 자동 적용 끄기(기존 설정도 해제)
 #   --no-systemd             observer systemd 등록과 docker 부팅 자동 시작을 건너뛴다(시험용, sudo 없는 PC)
@@ -30,7 +31,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/common.sh"
 
 PACKAGE_PATH=""
-ONLINE_INSTALL=0
 ONLINE_PACKAGE_PATH=""
 OPTION_ROOT=""
 OPTION_PROJECT=""
@@ -45,16 +45,19 @@ MOMS_URL=""
 REGISTER_SYSTEMD=1
 OBSERVER_SERVICE_NAME="acs-update-observer"
 
-usage() { sed -n '2,20p' "$0"; }
+usage() { sed -n '2,21p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --root=*) OPTION_ROOT="${1#*=}" ;;
     --project=*) OPTION_PROJECT="${1#*=}" ;;
     --gateway-url=*) OPTION_GATEWAY_URL="${1#*=}" ;;
-    --online) ONLINE_INSTALL=1 ;;
-    --online-url=*) OPTION_ONLINE_URL="${1#*=}" ;;
+    --input=*) PACKAGE_PATH="${1#*=}" ;;
+    --mode=*) OPTION_ONLINE_CHANNEL="${1#*=}" ;;
+    # 예전 옵션: 온라인이 기본이 되어 --online은 아무것도 하지 않고, --online-channel은 --mode와 같다.
+    --online) ;;
     --online-channel=*) OPTION_ONLINE_CHANNEL="${1#*=}" ;;
+    --online-url=*) OPTION_ONLINE_URL="${1#*=}" ;;
     --auto-update) OPTION_AUTO_UPDATE=1 ;;
     --no-auto-update) OPTION_AUTO_UPDATE=0 ;;
     --site-env=*) SITE_ENV_SOURCE="${1#*=}" ;;
@@ -64,11 +67,14 @@ while [ $# -gt 0 ]; do
     --no-systemd) REGISTER_SYSTEMD=0 ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "❌ 알 수 없는 옵션: $1" >&2; usage; exit 2 ;;
-    *) PACKAGE_PATH="$1" ;;
+    *) echo "❌ 오프라인 설치 ZIP은 --input=$1 로 지정하세요." >&2; exit 2 ;;
   esac
   shift
 done
-[ "$ONLINE_INSTALL" -eq 0 ] || [ -z "$PACKAGE_PATH" ] || { echo "❌ --online에는 로컬 ZIP을 함께 지정할 수 없습니다." >&2; exit 2; }
+if [ -n "$OPTION_ONLINE_CHANNEL" ] && ! [[ "$OPTION_ONLINE_CHANNEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "❌ --mode는 채널 이름(main, develop 등)이어야 합니다: $OPTION_ONLINE_CHANNEL" >&2
+  exit 2
+fi
 for required_command in python3 flock sha256sum; do
   command -v "$required_command" >/dev/null 2>&1 || { echo "❌ 필수 명령이 없습니다: $required_command" >&2; exit 1; }
 done
@@ -119,11 +125,11 @@ download_online_install() {
   echo "📥 온라인 설치 ZIP 다운로드 완료: $(basename "$relative_path")"
 }
 
-if [ "$ONLINE_INSTALL" -eq 1 ]; then
+if [ -z "$PACKAGE_PATH" ]; then
   download_online_install || exit 1
   trap 'rm -f "$ONLINE_PACKAGE_PATH"' EXIT
 else
-  [ -n "$PACKAGE_PATH" ] && [ -f "$PACKAGE_PATH" ] || { echo "❌ 릴리즈 ZIP을 지정하거나 --online을 사용하세요." >&2; usage; exit 2; }
+  [ -f "$PACKAGE_PATH" ] || { echo "❌ --input으로 지정한 ZIP이 없습니다: $PACKAGE_PATH" >&2; exit 2; }
   PACKAGE_PATH="$(cd "$(dirname "$PACKAGE_PATH")" && pwd)/$(basename "$PACKAGE_PATH")"
 fi
 

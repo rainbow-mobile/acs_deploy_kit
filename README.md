@@ -18,51 +18,45 @@ tests/
 
 ## 배포 흐름
 
-1. 개발 PC의 `rb_acs`에서 `make backend.deploy`를 실행합니다.
-2. 선택한 서비스만 빌드·패키징되고, 설치용 ZIP과 업데이트용 ZIP이 `~/acs-release/`에 만들어집니다.
-3. S3 옵션을 선택하면 같은 ZIP을 S3에도 올리고 Slack에는 다운로드 링크를 보냅니다. ZIP과 빌드 결과물은 Git에 넣지 않습니다.
-4. 최초 설치는 현장 PC에서 `deploy.sh`로 진행합니다.
-5. 이후에는 Debugger Version 탭에 업데이트 ZIP을 올리면 `observer.sh`가 `update.sh`를 실행합니다.
+1. 개발 PC의 `rb_acs`에서 `make backend.deploy`를 실행합니다. 선택한 서비스만 테스트·빌드해 서비스별 ZIP을 만들고 태그를 push합니다.
+2. GitHub Actions가 서비스 ZIP을 S3 `acs/<채널>/<서비스>/`에 올립니다. 통합 묶음을 고르면 서비스별 최신 ZIP과 이미지를 묶은
+   통합 ZIP(`acs/<채널>/<통합버전>.amd64.zip`)과 `latest.json`도 올립니다. 채널은 배포한 브랜치(main, develop)입니다.
+3. 최초 설치는 현장 PC에서 `deploy.sh`로 진행합니다. 기본은 온라인(`latest.json`의 통합 ZIP)이고, 인터넷이 없으면 `--input`으로 ZIP을 지정합니다.
+4. 이후에는 Debugger Version 탭에 서비스 ZIP·업데이트 ZIP을 올리면 `observer.sh`가 `update.sh`를 실행합니다.
 
 ## 최초 설치
 
+온라인 설치가 기본입니다(2026-11-03). `--mode`로 채널을 고르고, 오프라인 설치만 `--input`으로 ZIP을 지정합니다.
+
 ```bash
-./deploy.sh ~/acs-v1.2.3-install.zip \
+./deploy.sh                                  # 온라인 main 채널 최신 통합 ZIP으로 설치
+./deploy.sh --mode=develop                   # 온라인 develop 채널(개발 빌드)
+./deploy.sh --auto-update                    # 설치 후 온라인 자동 업데이트도 켬
+./deploy.sh --input=/path/acs-1.2.3.amd64.zip \
   --frs-url=http://192.168.0.10:3000 \
-  --moms-url=http://192.168.0.20:8080
+  --moms-url=http://192.168.0.20:8080        # 오프라인: 가져온 통합 ZIP으로 설치
 ```
 
 | 옵션 | 기본값 | 설명 |
 |---|---|---|
+| `--mode=<채널>` | `main` | 온라인 배포 채널(`acs/<채널>`). `develop`이면 개발 빌드 |
+| `--input=<파일>` | 없음(온라인) | 오프라인 설치에 쓸 통합 ZIP(이미지 포함). 주면 온라인으로 받지 않음 |
 | `--root=<디렉터리>` | 키트 옆 `rb-acs` | 설치 디렉터리 |
 | `--project=<이름>` | `rb-acs` | compose 프로젝트 이름 |
 | `--gateway-url=<주소>` | `http://127.0.0.1:13000` | 실행 중 Task 확인 주소 |
 | `--site-env=<파일>` | 없음 | 기존 현장 설정 복사 |
 | `--site-compose=<파일>` | 없음 | 현장 compose 덮어쓰기 |
-| `--online-channel=<이름>` | `main` | `acs/<채널>` 온라인 배포 채널 |
-| `--online-url=<주소>` | `https://diokjo4dtg1mp.cloudfront.net/acs/main` | 별도 배포 URL을 사용할 때 덮어쓰기 |
+| `--online-url=<주소>` | `https://diokjo4dtg1mp.cloudfront.net/acs/<채널>` | 별도 배포 URL을 사용할 때 덮어쓰기 |
 | `--auto-update` | 사용 안 함 | 온라인 최신 버전 자동 적용 활성화 |
 | `--no-auto-update` | 기본값 | 기존 온라인 자동 적용 설정도 해제 |
 | `--no-systemd` | 등록함 | 시험용으로 observer 등록 생략 |
 
+ZIP 경로를 옵션 없이 쓰면(`./deploy.sh acs.zip`) `--input=`을 쓰라고 안내하고 멈춥니다. 예전 옵션 `--online`은 아무것도 하지 않고,
+`--online-channel=<이름>`은 `--mode`와 같습니다. 고른 채널은 `/etc/rainbow/acs-env.conf`의 `ACS_RELEASE_CHANNEL`에 남아
+observer 자동 업데이트와 `update.sh --online`도 같은 채널을 봅니다. 다시 설치할 때 `--mode`를 주지 않으면 기록된 채널을 씁니다.
+
 사용자 홈은 코드에 고정하지 않습니다. 기본 설치 위치는 키트 위치를 기준으로 계산하고 `--root`로 바꿀 수 있습니다.
-
-온라인 자동배포는 기본적으로 꺼져 있습니다. 활성화할 현장에서만 다음처럼 설치합니다.
-
-```bash
-./deploy.sh acs-v1.2.3-install.zip \
-  --auto-update
-```
-
-로컬 설치 ZIP 없이 최신 설치용 파일을 온라인으로 받아 설치할 수도 있습니다.
-
-```bash
-./deploy.sh --online
-./deploy.sh --online --online-channel=develop
-./deploy.sh --online --auto-update   # 설치 후 자동 업데이트도 함께 활성화
-```
-
-`develop` 채널을 사용하려면 `--online-channel=develop`을 함께 지정합니다.
+온라인 자동배포는 기본적으로 꺼져 있고 `--auto-update`를 준 현장에서만 켜집니다.
 
 observer는 로컬로 업로드된 ZIP을 항상 먼저 처리합니다. 로컬 ZIP이 없고 자동배포가 켜진 경우에만
 `latest.json`을 조회하며, 현재보다 높은 버전의 업데이트 ZIP을 내려받아 SHA-256 검증 후 기존 `update.sh`로 적용합니다.

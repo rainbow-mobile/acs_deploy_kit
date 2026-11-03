@@ -147,7 +147,7 @@ make_release "$TEST_ROOT/acs-v2-task.zip" v2 task - "listen 13199;\n"
 make_release "$TEST_ROOT/acs-v3-state.zip" v3 state -
 
 echo "▶ deploy.sh --no-systemd: 설정 파일·site.env 생성 후 설치"
-bash "$KIT_DIR/deploy.sh" "$TEST_ROOT/acs-v1.zip" --root="$ACS_ROOT" --project=rb-acs-test --gateway-url=http://127.0.0.1:65530 \
+bash "$KIT_DIR/deploy.sh" --input="$TEST_ROOT/acs-v1.zip" --root="$ACS_ROOT" --project=rb-acs-test --gateway-url=http://127.0.0.1:65530 \
   --frs-url=http://10.0.0.5:3000 --no-systemd > "$TEST_ROOT/deploy.out" 2>&1
 assert_equal "deploy.sh 종료 코드" "0" "$?"
 assert_true "설정 파일에 설치 디렉터리" grep -q "ACS_ROOT=\"$ACS_ROOT\"" "$ACS_ENV_FILE"
@@ -304,7 +304,7 @@ assert_true "온라인 ZIP 다운로드" grep -q "acs-v7-task-update.zip" "$FAKE
 assert_true "온라인 새 버전 적용" grep -q "task 7.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_equal "온라인 적용 버전 기록" "7.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
 
-echo "▶ deploy.sh --online: 로컬 ZIP 없이 최신 설치용 ZIP을 받아 최초 설치"
+echo "▶ deploy.sh(기본 온라인): --input 없이 최신 설치용 ZIP을 받아 최초 설치"
 online_install_root="$TEST_ROOT/rb-acs-online"
 online_install_env="$TEST_ROOT/etc/acs-online-env.conf"
 make_release "$TEST_ROOT/acs-v8-install.zip" 8.0.0 "$ALL_SERVICES" v8
@@ -313,11 +313,15 @@ online_sha="$(sha256sum "$FAKE_ONLINE_PACKAGE" | cut -d' ' -f1)"
 cat > "$FAKE_ONLINE_MANIFEST" <<EOF
 {"kind":"acs.online-release","format_version":1,"version":"8.0.0","deploy":{"path":"deploy/8.0.0/acs-v8-install.zip","sha256":"$online_sha"},"update":{"path":"update/8.0.0/acs-v8-update.zip","sha256":"$online_sha"}}
 EOF
-ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --online --root="$online_install_root" \
+ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --mode=develop --root="$online_install_root" \
   --project=rb-acs-online-test --frs-url=http://10.0.0.5:3000 --no-systemd >/dev/null 2>&1
 assert_equal "온라인 최초 설치 종료 코드" "0" "$?"
 assert_equal "온라인 최초 설치 버전" "8.0.0" "$(json_value "$online_install_root/deploy/installed.json" version)"
 assert_true "온라인 최초 설치는 install ZIP 다운로드" grep -q "acs-v8-install.zip" "$FAKE_LOG"
+assert_true "--mode=develop은 develop 채널 latest.json" grep -q "acs/develop/latest.json" "$FAKE_LOG"
+assert_equal "--mode 채널 기록" "develop" "$(bash -c '. "$1"; echo "$ACS_RELEASE_CHANNEL"' _ "$online_install_env")"
+bash "$KIT_DIR/deploy.sh" "$TEST_ROOT/acs-v1.zip" --no-systemd >/dev/null 2>&1
+assert_equal "위치 인자 ZIP은 --input 안내 후 거절" "2" "$?"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
