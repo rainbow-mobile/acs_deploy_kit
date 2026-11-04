@@ -14,6 +14,9 @@
     installed-get <installed.json> <key>         설치 정보 값(version, images_tag)
     make-site-env <zip> <site.env> <frs_url> <moms_url>  ZIP의 site.env.example로 site.env를 만들고 DB 비밀번호를 무작위로 채움
     snapshot <staging> <acs_root> <installed.json> <archives_dir> <arch>  바뀔 서비스의 현재 bin·설정을 되돌리기용 릴리즈 ZIP으로 보관
+    online-summary <check_dir> <installed.json> <online.json> <channel> <base_url> <auto_update> <auto_update_source>
+                                                 observer가 받은 latest.json·서비스별 version.json으로 버전 탭 최신 버전 표시(online.json)
+    online-next <online.json> <installed.json>   자동 업데이트할 대상(total 또는 서비스 이름, 없으면 빈 줄)
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import socket
 import sys
 import tempfile
@@ -39,6 +43,16 @@ SUPPORTED_FORMAT_VERSION = 1
 TERMINAL_EXECUTION_STATES = {"completed", "stopped", "cancelled", "restarted", "idle"}
 # installed.json에 남기는 적용 이력 수입니다.
 HISTORY_LIMIT = 20
+# 업데이트 실행 기록(deploy/runs/<run_id>.json)을 남길 최근 개수입니다.
+RUN_LIMIT = 30
+# 업데이트 요청 출처입니다. Debugger 버전 탭이 이름으로 보여 줍니다.
+RUN_SOURCES = ("ui-upload", "ui-rollback", "ui-online", "online-auto", "online-manual", "offline-file", "cli", "install")
+# 버전 비교에 쓰는 세 자리 숫자 버전 형식입니다(v 접두사 허용).
+VERSION_PATTERN = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
+# online.json에 남길 연결 오류 내용 길이입니다.
+ONLINE_ERROR_LIMIT = 300
+# 업데이트 전 버전 보관본 기본 개수입니다. Common이 활성 Scenario 정책 값을 deploy/settings.json에 적으면 그 값을 씁니다.
+DEFAULT_ARCHIVE_KEEP_COUNT = 3
 
 
 def fail(message: str) -> None:
@@ -111,6 +125,29 @@ def json_get(file_name: str, key_path: str) -> None:
     print("" if value is None else value)
 
 
+def is_newer_version(candidate: str, installed: str) -> bool:
+    """candidate가 설치 버전보다 높은 세 자리 숫자 버전인지 봅니다. 설치 버전이 없으면(새 서비스) 높은 것으로 봅니다.
+
+    Args:
+        candidate (str): 온라인 후보 버전입니다.
+        installed (str): 현재 설치 버전입니다.
+
+    Returns:
+        bool: 더 높으면 True입니다. 후보가 숫자 버전이 아니거나 설치 버전이 숫자 버전이 아니면(시험 빌드) False입니다.
+    """
+    candidate_match = VERSION_PATTERN.fullmatch(candidate or "")
+    if not candidate_match:
+        return False
+    if not installed:
+        return True
+    installed_match = VERSION_PATTERN.fullmatch(installed)
+    if not installed_match:
+        return False
+    candidate_numbers = tuple(int(number or 0) for number in candidate_match.groups())
+    installed_numbers = tuple(int(number or 0) for number in installed_match.groups())
+    return candidate_numbers > installed_numbers
+
+
 def version_is_newer(candidate: str, installed: str) -> None:
     """candidate가 설치 버전보다 높은 세 자리 숫자 버전인지 출력합니다.
 
@@ -118,41 +155,84 @@ def version_is_newer(candidate: str, installed: str) -> None:
         candidate (str): 온라인 후보 버전입니다.
         installed (str): 현재 설치 버전입니다.
     """
-    version_pattern = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
-
-    def version_numbers(version: str) -> tuple[int, int, int] | None:
-        version_match = version_pattern.fullmatch(version)
-        if not version_match:
-            return None
-        return tuple(int(number or 0) for number in version_match.groups())
-
-    candidate_numbers = version_numbers(candidate)
-    installed_numbers = version_numbers(installed)
-    if candidate_numbers is None or installed_numbers is None:
-        print("false")
-        return
-    print("true" if candidate_numbers > installed_numbers else "false")
+    print("true" if installed and is_newer_version(candidate, installed) else "false")
 
 
-def download(url: str, output_name: str, timeout_text: str) -> None:
-    """curl이 없는 현장에서도 HTTP(S) 파일을 내려받습니다.
+# 다운로드 경과를 출력하는 최소 간격(초)입니다. 터미널과 observer 로그 모두 줄 단위로 남깁니다.
+DOWNLOAD_PROGRESS_INTERVAL_SEC = 3
+
+
+def format_duration(seconds: float) -> str:
+    """초를 `2m05s`처럼 읽기 쉽게 바꿉니다.
+
+    Args:
+        seconds (float): 초입니다.
+
+    Returns:
+        str: 표시 문자열입니다.
+    """
+    whole_seconds = int(seconds)
+    return f"{whole_seconds // 60}m{whole_seconds % 60:02d}s" if whole_seconds >= 60 else f"{whole_seconds}s"
+
+
+def download(url: str, output_name: str, timeout_text: str, progress_text: str = "0") -> None:
+    """HTTP(S) 파일을 내려받습니다. progress면 받은 양·속도·경과·남은 시간을 몇 초마다 한 줄씩 출력합니다.
 
     Args:
         url (str): 다운로드 URL입니다.
         output_name (str): 저장할 파일 경로입니다.
         timeout_text (str): 요청 제한 시간(초)입니다.
+        progress_text (str): "1"이면 경과를 출력합니다.
     """
     request = Request(url, headers={"User-Agent": "RB-ACS-Deploy/1", "Cache-Control": "no-cache"})
     output_path = Path(output_name)
     partial_path = output_path.with_name(f".{output_path.name}.part")
+    show_progress = progress_text == "1"
+    file_label = url.rsplit("/", 1)[-1]
+    started_at = time.monotonic()
+    # 종료 신호(SIGTERM)도 예외로 바꿔 아래에서 받던 파일을 지우게 합니다.
+    signal.signal(signal.SIGTERM, lambda signal_number, frame: sys.exit(143))
     try:
         with urlopen(request, timeout=int(timeout_text)) as response, partial_path.open("wb") as output_file:
-            while chunk := response.read(4 * 1024 * 1024):
+            total_bytes = int(response.headers.get("Content-Length") or 0)
+            received_bytes = 0
+            reported_at = started_at
+            while chunk := response.read(1024 * 1024):
                 output_file.write(chunk)
+                received_bytes += len(chunk)
+                now = time.monotonic()
+                if show_progress and now - reported_at >= DOWNLOAD_PROGRESS_INTERVAL_SEC:
+                    reported_at = now
+                    elapsed_seconds = now - started_at
+                    speed = received_bytes / elapsed_seconds if elapsed_seconds > 0 else 0
+                    received_megabytes = received_bytes / 1024 / 1024
+                    if total_bytes:
+                        remaining_seconds = (total_bytes - received_bytes) / speed if speed > 0 else 0
+                        print(
+                            f"   📥 {file_label} {received_bytes * 100 // total_bytes:3d}% "
+                            f"{received_megabytes:.0f}/{total_bytes / 1024 / 1024:.0f}MB · {speed / 1024 / 1024:.1f}MB/s · "
+                            f"경과 {format_duration(elapsed_seconds)} · 남은 시간 약 {format_duration(remaining_seconds)}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"   📥 {file_label} {received_megabytes:.0f}MB · {speed / 1024 / 1024:.1f}MB/s · 경과 {format_duration(elapsed_seconds)}",
+                            flush=True,
+                        )
         os.replace(partial_path, output_path)
+        if show_progress:
+            elapsed_seconds = time.monotonic() - started_at
+            print(
+                f"   📥 {file_label} 완료 {received_bytes / 1024 / 1024:.0f}MB · 걸린 시간 {format_duration(elapsed_seconds)}",
+                flush=True,
+            )
     except (OSError, ValueError) as error:
         partial_path.unlink(missing_ok=True)
         fail(f"다운로드 실패: {error}")
+    except BaseException:
+        # Ctrl+C·종료 신호로 멈추면 받던 파일을 남기지 않습니다.
+        partial_path.unlink(missing_ok=True)
+        raise
 
 
 def extract(archive_name: str, staging_name: str) -> None:
@@ -265,6 +345,120 @@ def write_status(status_name: str, state: str, stage: str, message: str, package
     })
 
 
+def utc_now_text() -> str:
+    """현재 UTC 시각 문자열입니다.
+
+    Returns:
+        str: 예) 2026-11-03T06:10:00Z
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run_start(runs_name: str, run_id: str, source: str, package: str) -> None:
+    """업데이트 실행 기록을 만듭니다. 같은 run_id 기록이 있으면(Task 대기 뒤 다시 시도) 그대로 이어 씁니다.
+
+    Args:
+        runs_name (str): deploy/runs 디렉터리입니다.
+        run_id (str): 실행 ID입니다.
+        source (str): 요청 출처(RUN_SOURCES)입니다.
+        package (str): ZIP 이름입니다.
+    """
+    if source not in RUN_SOURCES:
+        fail(f"알 수 없는 업데이트 출처입니다: {source}")
+    runs_directory = Path(runs_name)
+    runs_directory.mkdir(parents=True, exist_ok=True)
+    run_path = runs_directory / f"{run_id}.json"
+    if not run_path.is_file():
+        write_json_atomic(run_path, {
+            "run_id": run_id, "source": source, "package": package, "version": None, "result": "running",
+            "started_at": utc_now_text(), "ended_at": None, "stopped_stage": None, "stages": [], "notes": [],
+        })
+    # 오래된 실행 기록은 RUN_LIMIT개만 남깁니다.
+    run_paths = sorted(runs_directory.glob("*.json"), key=lambda path: path.stat().st_mtime)
+    for old_run_path in run_paths[:-RUN_LIMIT]:
+        old_run_path.unlink(missing_ok=True)
+
+
+def run_stage(run_name: str, state: str, stage: str, message: str, version: str) -> None:
+    """실행 기록에 단계 진행을 남깁니다. 단계가 바뀌면 앞 단계를 끝내고, 끝 상태(success·failed)면 실행을 끝냅니다.
+
+    Args:
+        run_name (str): 실행 기록 파일입니다. 없으면 아무것도 하지 않습니다.
+        state (str): queued·waiting·running·success·failed입니다.
+        stage (str): 진행 단계입니다.
+        message (str): 단계 메시지입니다.
+        version (str): 릴리즈 버전입니다(알면).
+    """
+    run_path = Path(run_name)
+    if not run_path.is_file():
+        return
+    run_record = read_json(run_path)
+    now_text = utc_now_text()
+    stages = run_record.setdefault("stages", [])
+    last_stage = stages[-1] if stages else None
+    if last_stage and last_stage["stage"] == stage:
+        last_stage.update({"state": state, "message": message})
+    else:
+        if last_stage and not last_stage.get("ended_at"):
+            last_stage["ended_at"] = now_text
+            if last_stage["state"] in ("running", "queued", "waiting"):
+                last_stage["state"] = "done"
+        stages.append({"stage": stage, "state": state, "message": message, "started_at": now_text, "ended_at": None})
+    if version:
+        run_record["version"] = version
+    if state in ("success", "failed"):
+        stages[-1]["ended_at"] = now_text
+        run_record.update({"result": state, "ended_at": now_text})
+        if state == "failed":
+            # 되돌리기(rollback) 단계에서 끝났으면 실제로 실패한 그 앞 단계를 멈춘 단계로 남깁니다.
+            failed_stages = [stage_record["stage"] for stage_record in stages if stage_record["stage"] != "rollback"]
+            run_record["stopped_stage"] = failed_stages[-1] if stage == "rollback" and failed_stages else stage
+    elif state == "waiting":
+        run_record["result"] = "waiting"
+    else:
+        run_record["result"] = "running"
+    write_json_atomic(run_path, run_record)
+
+
+def run_note(run_name: str, level: str, stage: str, message: str) -> None:
+    """실행 기록에 경고·에러를 남깁니다.
+
+    Args:
+        run_name (str): 실행 기록 파일입니다. 없으면 아무것도 하지 않습니다.
+        level (str): warning 또는 error입니다.
+        stage (str): 그때 단계입니다.
+        message (str): 내용입니다.
+    """
+    run_path = Path(run_name)
+    if not run_path.is_file():
+        return
+    run_record = read_json(run_path)
+    run_record.setdefault("notes", []).append({"level": level, "stage": stage, "message": message, "at": utc_now_text()})
+    write_json_atomic(run_path, run_record)
+
+
+def prune_archives(archives_name: str, settings_name: str) -> None:
+    """업데이트 전 버전 보관본을 정해진 개수만 남기고 오래된 것부터 지웁니다. 지운 파일 이름을 출력합니다.
+
+    개수는 deploy/settings.json의 archive_keep_count(활성 Scenario 정책, Common이 씀)이고 없으면 DEFAULT_ARCHIVE_KEEP_COUNT입니다.
+
+    Args:
+        archives_name (str): deploy/archives 디렉터리입니다.
+        settings_name (str): deploy/settings.json 경로입니다.
+    """
+    keep_count = DEFAULT_ARCHIVE_KEEP_COUNT
+    settings_path = Path(settings_name)
+    if settings_path.is_file():
+        try:
+            keep_count = max(1, int(read_json(settings_path).get("archive_keep_count") or DEFAULT_ARCHIVE_KEEP_COUNT))
+        except (TypeError, ValueError):
+            keep_count = DEFAULT_ARCHIVE_KEEP_COUNT
+    archive_paths = sorted(Path(archives_name).glob("acs-rollback-*.zip"), key=lambda path: path.stat().st_mtime)
+    for old_archive_path in archive_paths[:-keep_count]:
+        old_archive_path.unlink(missing_ok=True)
+        print(old_archive_path.name)
+
+
 def write_heartbeat(heartbeat_name: str, interval_seconds: str) -> None:
     """observer heartbeat(observer.json)를 씁니다. 화면은 경과 시간으로 observer 동작 여부를 판단합니다.
 
@@ -277,7 +471,9 @@ def write_heartbeat(heartbeat_name: str, interval_seconds: str) -> None:
     })
 
 
-def record(installed_name: str, staging_name: str, images_tag: str, result: str, message: str) -> None:
+def record(
+    installed_name: str, staging_name: str, images_tag: str, result: str, message: str, run_id: str = "", source: str = "",
+) -> None:
     """적용 결과를 installed.json에 남깁니다. 성공이면 전체·서비스별 버전과 이미지 태그를 바꾸고, 실패면 이력만 더합니다.
 
     Args:
@@ -286,6 +482,8 @@ def record(installed_name: str, staging_name: str, images_tag: str, result: str,
         images_tag (str): 적용 후 Gateway·Zenoh router 이미지 태그입니다.
         result (str): success 또는 failed입니다.
         message (str): 결과 메시지입니다.
+        run_id (str): 실행 기록 ID입니다(deploy/runs/<run_id>.json).
+        source (str): 요청 출처입니다.
     """
     installed_path = Path(installed_name)
     installed = read_json(installed_path)
@@ -302,7 +500,7 @@ def record(installed_name: str, staging_name: str, images_tag: str, result: str,
     history = installed.get("history") or []
     history.append({
         "version": manifest.get("version"), "result": result, "at": applied_at, "message": message,
-        "services": sorted(manifest.get("services") or {}),
+        "services": sorted(manifest.get("services") or {}), "run_id": run_id or None, "source": source or None,
     })
     installed["history"] = history[-HISTORY_LIMIT:]
     write_json_atomic(installed_path, installed)
@@ -449,6 +647,89 @@ def snapshot(staging_name: str, acs_root_name: str, installed_name: str, archive
     print(archive_path)
 
 
+def online_summary(
+    check_name: str, installed_name: str, online_name: str, channel: str, base_url: str, auto_update: str, auto_update_source: str,
+) -> None:
+    """observer가 받은 매니페스트로 버전 탭이 보여 줄 최신 버전(online.json)을 씁니다.
+
+    check_dir에는 `latest.json`(통합)과 `services/<서비스>.json`(서비스별 version.json)이 받은 것만 있고, 받지 못한 이유는 `error`에
+    있습니다. 하나도 받지 못하면 인터넷에 연결되지 않은 것(reachable=false)으로 남깁니다. 새 버전 여부(newer)는 지금 설치 버전과 비교합니다.
+
+    Args:
+        check_name (str): 받은 매니페스트 디렉터리입니다.
+        installed_name (str): installed.json 경로입니다.
+        online_name (str): 쓸 online.json 경로입니다.
+        channel (str): 온라인 채널(main·develop)입니다.
+        base_url (str): 채널 주소입니다.
+        auto_update (str): 지금 적용 중인 자동 업데이트 설정("1"이면 켜짐)입니다.
+        auto_update_source (str): 자동 업데이트 설정 출처(ui: 버전 탭, site-config: 설치 설정 파일)입니다.
+    """
+    check_directory = Path(check_name)
+    installed = read_json(Path(installed_name))
+    installed_services = installed.get("services") or {}
+    total = None
+    latest_manifest = read_json(check_directory / "latest.json")
+    if latest_manifest.get("kind") == "acs.online-release" and latest_manifest.get("version"):
+        update_entry = latest_manifest.get("update") or {}
+        total = {
+            "version": latest_manifest["version"], "installed": installed.get("version"),
+            "newer": is_newer_version(latest_manifest["version"], installed.get("version") or "0.0.0"),
+            "path": update_entry.get("path"), "sha256": update_entry.get("sha256"),
+        }
+    services = {}
+    services_directory = check_directory / "services"
+    for service_path in sorted(services_directory.glob("*.json")) if services_directory.is_dir() else []:
+        service_document = read_json(service_path)
+        service_version = str(service_document.get("new_version") or "")
+        if not VERSION_PATTERN.fullmatch(service_version):
+            continue
+        service_name = service_path.stem
+        installed_version = (installed_services.get(service_name) or {}).get("version") or ""
+        services[service_name] = {
+            "version": service_version, "installed": installed_version or None,
+            "newer": is_newer_version(service_version, installed_version),
+            # 서비스 ZIP은 <채널>/<서비스>/<버전>.zip입니다. sha256은 새로 배포한 서비스부터 version.json에 있습니다.
+            "path": service_document.get("path") or f"{service_name}/{service_version}.zip",
+            "sha256": service_document.get("sha256"),
+        }
+    reachable = total is not None or bool(services) or (check_directory / "latest.json").is_file()
+    try:
+        error_text = (check_directory / "error").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        error_text = ""
+    write_json_atomic(Path(online_name), {
+        "checked_at": utc_now_text(), "channel": channel, "base_url": base_url, "reachable": reachable,
+        "error": None if reachable else (error_text[-ONLINE_ERROR_LIMIT:] or "릴리즈 채널에 연결하지 못했습니다"),
+        "auto_update": auto_update == "1", "auto_update_source": auto_update_source,
+        "total": total, "services": services,
+    })
+
+
+def online_next(online_name: str, installed_name: str) -> None:
+    """자동 업데이트할 대상을 출력합니다. 통합 버전이 새로우면 total, 아니면 새 버전이 있는 첫 서비스, 없으면 빈 줄입니다.
+
+    online.json을 쓴 뒤 업데이트했을 수 있어 새 버전 여부는 지금 installed.json과 다시 비교합니다(같은 ZIP을 다시 받지 않게).
+
+    Args:
+        online_name (str): online.json 경로입니다.
+        installed_name (str): installed.json 경로입니다.
+    """
+    online = read_json(Path(online_name))
+    installed = read_json(Path(installed_name))
+    total = online.get("total") or {}
+    if online.get("reachable") and total.get("path") and is_newer_version(str(total.get("version") or ""), installed.get("version") or "0.0.0"):
+        print("total")
+        return
+    installed_services = installed.get("services") or {}
+    for service_name, service_entry in sorted((online.get("services") or {}).items()):
+        installed_version = (installed_services.get(service_name) or {}).get("version") or ""
+        # 설치하지 않은 서비스는 자동으로 들이지 않습니다(버전 탭에서 직접 고릅니다).
+        if installed_version and is_newer_version(str(service_entry.get("version") or ""), installed_version):
+            print(service_name)
+            return
+    print("")
+
+
 def main(arguments: list[str]) -> None:
     """명령 이름으로 처리 함수를 고릅니다.
 
@@ -470,8 +751,16 @@ def main(arguments: list[str]) -> None:
         write_status(*command_arguments)
     elif command_name == "write-heartbeat" and len(command_arguments) == 2:
         write_heartbeat(*command_arguments)
-    elif command_name == "record" and len(command_arguments) == 5:
+    elif command_name == "record" and len(command_arguments) in (5, 7):
         record(*command_arguments)
+    elif command_name == "run-start" and len(command_arguments) == 4:
+        run_start(*command_arguments)
+    elif command_name == "run-stage" and len(command_arguments) == 5:
+        run_stage(*command_arguments)
+    elif command_name == "run-note" and len(command_arguments) == 4:
+        run_note(*command_arguments)
+    elif command_name == "prune-archives" and len(command_arguments) == 2:
+        prune_archives(*command_arguments)
     elif command_name == "installed-get" and len(command_arguments) == 2:
         installed_get(*command_arguments)
     elif command_name == "make-site-env" and len(command_arguments) == 4:
@@ -482,8 +771,12 @@ def main(arguments: list[str]) -> None:
         json_get(*command_arguments)
     elif command_name == "version-is-newer" and len(command_arguments) == 2:
         version_is_newer(*command_arguments)
-    elif command_name == "download" and len(command_arguments) == 3:
+    elif command_name == "download" and len(command_arguments) in (3, 4):
         download(*command_arguments)
+    elif command_name == "online-summary" and len(command_arguments) == 7:
+        online_summary(*command_arguments)
+    elif command_name == "online-next" and len(command_arguments) == 2:
+        online_next(*command_arguments)
     else:
         fail(f"알 수 없는 명령이거나 인자 수가 다릅니다: {' '.join(arguments)}")
 

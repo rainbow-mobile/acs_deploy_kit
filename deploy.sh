@@ -5,6 +5,8 @@
 #   통합 ZIP은 rb_acs의 배포 Action이 `make backend.deploy`의 통합 묶음으로 만든다.
 #   --mode=<채널>            온라인 배포 채널 (기본: main, develop이면 개발 빌드. URL은 .../acs/<채널>)
 #   --input=<파일>           오프라인 설치에 쓸 통합 ZIP. 주면 온라인으로 받지 않는다
+#   --reinstall              이미 설치된 버전이 온라인 최신과 같거나 높아도 다시 받아 설치한다
+#   --reinstall              이미 설치된 버전이 온라인 최신과 같거나 높아도 다시 받아 설치한다
 #
 #   --root=<디렉터리>        설치 디렉터리 (기본: 배포 키트 옆 rb-acs, 예: ~/rb-acs)
 #   --project=<이름>         compose 프로젝트 이름 (기본: rb-acs)
@@ -34,6 +36,7 @@ ORIGINAL_ARGUMENTS=("$@")
 . "$SCRIPT_DIR/common.sh"
 
 PACKAGE_PATH=""
+REINSTALL=0
 ONLINE_PACKAGE_PATH=""
 OPTION_ROOT=""
 OPTION_PROJECT=""
@@ -48,7 +51,7 @@ MOMS_URL=""
 REGISTER_SYSTEMD=1
 OBSERVER_SERVICE_NAME="acs-update-observer"
 
-usage() { sed -n '2,21p' "$0"; }
+usage() { sed -n '2,22p' "$0"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -56,6 +59,7 @@ while [ $# -gt 0 ]; do
     --project=*) OPTION_PROJECT="${1#*=}" ;;
     --gateway-url=*) OPTION_GATEWAY_URL="${1#*=}" ;;
     --input=*) PACKAGE_PATH="${1#*=}" ;;
+    --reinstall) REINSTALL=1 ;;
     --mode=*) OPTION_ONLINE_CHANNEL="${1#*=}" ;;
     # 예전 옵션: 온라인이 기본이 되어 --online은 아무것도 하지 않고, --online-channel은 --mode와 같다.
     --online) ;;
@@ -102,36 +106,67 @@ fi
 mkdir -p "$ACS_ROOT"
 ACS_ROOT="$(cd "$ACS_ROOT" && pwd)"
 
-download_online_install() {
-  local manifest_path expected_sha actual_sha relative_path
-  manifest_path="$(mktemp /tmp/acs-online-latest.XXXXXX.json)"
-  ONLINE_PACKAGE_PATH="$(mktemp /tmp/acs-online-install.XXXXXX.zip)"
+# 온라인 설치는 latest.json을 먼저 보고, 설치된 버전보다 새로울 때만 큰 ZIP을 받는다.
+# 받는 파일은 설치 디렉터리의 .download/에 두고 끝나거나 실패·중단되면 지운다(지난번에 강제로 꺼져 남은 것도 시작할 때 지운다).
+DOWNLOAD_DIR="$ACS_ROOT/.download"
+ONLINE_MANIFEST_PATH="$DOWNLOAD_DIR/latest.json"
+ONLINE_RELATIVE_PATH=""
+ONLINE_EXPECTED_SHA=""
+ONLINE_VERSION=""
+cleanup_downloads() { rm -rf "$DOWNLOAD_DIR"; }
+
+check_online_release() {
+  local installed_file="$ACS_ROOT/deploy/installed.json" installed_version
+  cleanup_downloads
+  mkdir -p "$DOWNLOAD_DIR"
+  trap cleanup_downloads EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   echo "🌐 온라인 최신 설치 릴리즈 확인: $ACS_RELEASE_BASE_URL/latest.json"
-  download_file "$ACS_RELEASE_BASE_URL/latest.json" "$manifest_path" 15 \
-    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ latest.json을 받지 못했습니다." >&2; return 1; }
-  [ "$(release_tool json-get "$manifest_path" kind)" = "acs.online-release" ] \
-    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 매니페스트 형식이 올바르지 않습니다." >&2; return 1; }
-  relative_path="$(release_tool json-get "$manifest_path" deploy.path)"
-  expected_sha="$(release_tool json-get "$manifest_path" deploy.sha256)"
-  case "$relative_path" in
-    ""|/*|*".."*) rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 경로가 올바르지 않습니다." >&2; return 1 ;;
+  download_file "$ACS_RELEASE_BASE_URL/latest.json" "$ONLINE_MANIFEST_PATH" 15 \
+    || { echo "❌ latest.json을 받지 못했습니다." >&2; return 1; }
+  [ "$(release_tool json-get "$ONLINE_MANIFEST_PATH" kind)" = "acs.online-release" ] \
+    || { echo "❌ 온라인 매니페스트 형식이 올바르지 않습니다." >&2; return 1; }
+  ONLINE_VERSION="$(release_tool json-get "$ONLINE_MANIFEST_PATH" version)"
+  ONLINE_RELATIVE_PATH="$(release_tool json-get "$ONLINE_MANIFEST_PATH" deploy.path)"
+  ONLINE_EXPECTED_SHA="$(release_tool json-get "$ONLINE_MANIFEST_PATH" deploy.sha256)"
+  case "$ONLINE_RELATIVE_PATH" in
+    ""|/*|*".."*) echo "❌ 온라인 설치 경로가 올바르지 않습니다." >&2; return 1 ;;
   esac
-  [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] \
-    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 sha256이 올바르지 않습니다." >&2; return 1; }
-  download_file "$ACS_RELEASE_BASE_URL/$relative_path" "$ONLINE_PACKAGE_PATH" 1800 \
-    || { rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 ZIP을 받지 못했습니다." >&2; return 1; }
-  actual_sha="$(sha256sum "$ONLINE_PACKAGE_PATH" | cut -d' ' -f1)"
-  rm -f "$manifest_path"
-  [ "$actual_sha" = "$expected_sha" ] \
-    || { rm -f "$ONLINE_PACKAGE_PATH"; echo "❌ 온라인 설치 ZIP sha256이 맞지 않습니다." >&2; return 1; }
-  PACKAGE_PATH="$ONLINE_PACKAGE_PATH"
-  echo "📥 온라인 설치 ZIP 다운로드 완료: $(basename "$relative_path")"
+  [[ "$ONLINE_EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "❌ 온라인 설치 sha256이 올바르지 않습니다." >&2; return 1; }
+  if [ -f "$installed_file" ] && [ "$REINSTALL" -eq 0 ]; then
+    installed_version="$(release_tool installed-get "$installed_file" version)"
+    if [ "$(release_tool version-is-newer "$ONLINE_VERSION" "$installed_version")" != "true" ]; then
+      echo "✅ 이미 최신 버전($installed_version)이 설치되어 있습니다(온라인 $ONLINE_VERSION). 다시 설치하려면 --reinstall을 주세요."
+      return 3
+    fi
+    echo "🆕 새 버전이 있습니다: $installed_version → $ONLINE_VERSION"
+  else
+    echo "🆕 온라인 최신 버전: $ONLINE_VERSION"
+  fi
 }
 
-# 오프라인 ZIP은 사전 준비(sudo) 전에 있는지부터 확인합니다.
+download_online_install() {
+  local actual_sha
+  ONLINE_PACKAGE_PATH="$DOWNLOAD_DIR/$(basename "$ONLINE_RELATIVE_PATH")"
+  echo "📥 온라인 설치 ZIP 다운로드: $ACS_RELEASE_BASE_URL/$ONLINE_RELATIVE_PATH"
+  download_file "$ACS_RELEASE_BASE_URL/$ONLINE_RELATIVE_PATH" "$ONLINE_PACKAGE_PATH" 1800 1 \
+    || { echo "❌ 온라인 설치 ZIP을 받지 못했습니다." >&2; return 1; }
+  actual_sha="$(sha256sum "$ONLINE_PACKAGE_PATH" | cut -d' ' -f1)"
+  [ "$actual_sha" = "$ONLINE_EXPECTED_SHA" ] || { echo "❌ 온라인 설치 ZIP sha256이 맞지 않습니다." >&2; return 1; }
+  PACKAGE_PATH="$ONLINE_PACKAGE_PATH"
+  echo "📥 온라인 설치 ZIP 다운로드 완료: $(basename "$ONLINE_RELATIVE_PATH")"
+}
+
+# 오프라인 ZIP은 있는지, 온라인은 설치된 버전보다 새 버전이 있는지를 사전 준비(sudo)·큰 다운로드 전에 확인합니다.
 if [ -n "$PACKAGE_PATH" ]; then
   [ -f "$PACKAGE_PATH" ] || { echo "❌ --input으로 지정한 ZIP이 없습니다: $PACKAGE_PATH" >&2; exit 2; }
   PACKAGE_PATH="$(cd "$(dirname "$PACKAGE_PATH")" && pwd)/$(basename "$PACKAGE_PATH")"
+else
+  online_check_status=0
+  check_online_release || online_check_status=$?
+  [ "$online_check_status" -eq 3 ] && exit 0
+  [ "$online_check_status" -eq 0 ] || exit 1
 fi
 
 echo ""
@@ -160,8 +195,8 @@ ensure_docker() {
     return 0
   fi
   if command -v apt-get >/dev/null 2>&1 && can_use_network; then
-    echo "🐳 Docker 설치(apt)..."
-    sudo apt-get update -qq && sudo apt-get install -y docker.io docker-compose-v2 >/dev/null || true
+    echo "🐳 Docker 설치(apt). 패키지 받는 과정을 그대로 보여 줍니다..."
+    sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2 || true
   fi
   # 설치 직후 데몬이 꺼져 있을 수 있어 부팅 자동 시작과 함께 켭니다.
   if command -v systemctl >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
@@ -210,14 +245,14 @@ check_compose_version
 ensure_docker_permission
 if ! command -v inotifywait >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1 && can_use_network; then
-    sudo apt-get install -y inotify-tools >/dev/null 2>&1 || true
+    echo "📦 inotify-tools 설치(apt)..."
+    sudo apt-get install -y inotify-tools || true
   fi
   command -v inotifywait >/dev/null 2>&1 || echo "ℹ️  inotify-tools가 없어 observer가 ${CHECK_INTERVAL_SEC}초마다 확인합니다."
 fi
 
 if [ -z "$PACKAGE_PATH" ]; then
   download_online_install || exit 1
-  trap 'rm -f "$ONLINE_PACKAGE_PATH"' EXIT
 fi
 echo "📦 릴리즈: $PACKAGE_PATH"
 

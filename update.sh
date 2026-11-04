@@ -1,7 +1,10 @@
 #!/bin/bash
 # update.sh — ACS 릴리즈 ZIP(rb_acs `make backend.deploy`)을 설치 디렉터리에 적용하는 업데이트 엔진.
-# 사용법: update.sh [--install] [--force] <acs-<버전>.zip> | update.sh [--force] --online
+# 사용법: update.sh [--install] [--force] [--source=<출처>] [--run-id=<ID>] <acs-<버전>.zip> | update.sh [--force] --online
 #   --install  최초 설치(deploy.sh가 부름). 실행 중 Task 확인·DB 백업을 건너뛴다.
+#   --source   요청 출처(ui-upload·ui-rollback·online-auto·online-manual·offline-file·cli·install). 기본은 직접 실행(cli),
+#              --online이면 online-manual, --install이면 install. observer가 Common이 남긴 출처를 넘긴다.
+#   --run-id   실행 기록 ID. Task를 기다렸다 다시 시도할 때 같은 기록(deploy/runs/<ID>.json)을 이어 쓴다.
 #   --force    실행 중 Task가 있어도 적용한다(버전 탭 "강제 적용", observe/<이름>.zip.force).
 #   --online   설정된 S3/CloudFront 채널의 최신 업데이트 ZIP을 지금 내려받아 적용한다(자동배포 설정과 무관).
 # 종료 코드: 0 적용 완료, 75 실행 중 Task 때문에 대기(ZIP을 두고 나중에 다시), 1 실패(바꾼 것은 되돌림), 2 사용법 오류.
@@ -30,12 +33,16 @@ FORCE_MODE=0
 ONLINE_MODE=0
 PACKAGE_PATH=""
 ONLINE_PACKAGE_PATH=""
+RUN_SOURCE=""
+RUN_ID=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --install) INSTALL_MODE=1 ;;
+    --source=*) RUN_SOURCE="${1#*=}" ;;
+    --run-id=*) RUN_ID="${1#*=}" ;;
     --force) FORCE_MODE=1 ;;
     --online) ONLINE_MODE=1 ;;
-    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     -*) echo "알 수 없는 옵션: $1" >&2; exit 2 ;;
     *) PACKAGE_PATH="$1" ;;
   esac
@@ -55,6 +62,16 @@ if [ -f "$UPDATE_LOG" ] && [ "$(stat -c %s "$UPDATE_LOG" 2>/dev/null || echo 0)"
 fi
 exec > >(tee -a "$UPDATE_LOG") 2>&1
 
+# 이번 업데이트 실행 기록을 만든다. 출처를 안 주면 직접 실행(cli)·수동 온라인·최초 설치로 본다.
+if [ -z "$RUN_SOURCE" ]; then
+  if [ "$INSTALL_MODE" -eq 1 ]; then RUN_SOURCE="install"
+  elif [ "$ONLINE_MODE" -eq 1 ]; then RUN_SOURCE="online-manual"
+  else RUN_SOURCE="cli"; fi
+fi
+RUN_ID="${RUN_ID:-$(new_run_id)}"
+RUN_FILE="$RUNS_DIR/$RUN_ID.json"
+release_tool run-start "$RUNS_DIR" "$RUN_ID" "$RUN_SOURCE" "${CURRENT_PACKAGE:-$(basename "${PACKAGE_PATH:-online}")}" || RUN_FILE=""
+
 # 업데이트는 한 번에 하나만 한다(observer와 수동 실행이 겹치지 않게).
 exec 9>"$DEPLOY_DIR/.update.lock"
 if ! flock -n 9; then
@@ -64,13 +81,26 @@ fi
 
 download_online_release() {
   local manifest_path="$DEPLOY_DIR/.manual-online-latest.json"
-  local relative_path expected_sha actual_sha
+  local relative_path expected_sha actual_sha online_version installed_version
   [ -n "$ACS_RELEASE_BASE_URL" ] || { log "온라인 배포 주소가 설정되지 않았습니다."; return 1; }
+  # 지난번에 중간에 꺼져 남은 파일을 지우고, 이번에 실패·중단해도 받던 파일을 남기지 않습니다.
+  rm -f "$manifest_path" "$DEPLOY_DIR/.manual-online-update.zip" "$DEPLOY_DIR/..manual-online-update.zip.part"
+  trap 'rm -f "$DEPLOY_DIR/.manual-online-latest.json" "$DEPLOY_DIR/.manual-online-update.zip" "$DEPLOY_DIR/..manual-online-update.zip.part"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   log "온라인 최신 릴리즈 확인: $ACS_RELEASE_BASE_URL/latest.json"
   download_file "$ACS_RELEASE_BASE_URL/latest.json" "$manifest_path" 15 \
     || { log "latest.json을 받지 못했습니다."; return 1; }
   [ "$(release_tool json-get "$manifest_path" kind)" = "acs.online-release" ] \
     || { log "온라인 매니페스트 형식이 올바르지 않습니다."; rm -f "$manifest_path"; return 1; }
+  online_version="$(release_tool json-get "$manifest_path" version)"
+  installed_version="$(release_tool installed-get "$INSTALLED_FILE" version)"
+  if [ "$(release_tool version-is-newer "$online_version" "$installed_version")" != "true" ]; then
+    log "이미 최신 버전($installed_version)입니다(온라인 $online_version). 받지 않습니다."
+    rm -f "$manifest_path"
+    return 3
+  fi
+  log "새 버전이 있습니다: $installed_version → $online_version"
   relative_path="$(release_tool json-get "$manifest_path" update.path)"
   expected_sha="$(release_tool json-get "$manifest_path" update.sha256)"
   case "$relative_path" in
@@ -79,7 +109,7 @@ download_online_release() {
   [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] \
     || { log "온라인 업데이트 sha256이 올바르지 않습니다."; rm -f "$manifest_path"; return 1; }
   ONLINE_PACKAGE_PATH="$DEPLOY_DIR/.manual-online-update.zip"
-  if ! download_file "$ACS_RELEASE_BASE_URL/$relative_path" "$ONLINE_PACKAGE_PATH" 1800; then
+  if ! download_file "$ACS_RELEASE_BASE_URL/$relative_path" "$ONLINE_PACKAGE_PATH" 1800 1; then
     log "온라인 업데이트 ZIP을 받지 못했습니다."
     rm -f "$manifest_path" "$ONLINE_PACKAGE_PATH"
     return 1
@@ -97,7 +127,19 @@ download_online_release() {
 }
 
 if [ "$ONLINE_MODE" -eq 1 ]; then
-  download_online_release || exit 1
+  online_download_status=0
+  download_online_release || online_download_status=$?
+  if [ "$online_download_status" -eq 3 ]; then
+    # 받을 새 버전이 없으면 실행 기록을 남기지 않는다.
+    rm -f "$RUN_FILE"
+    exit 0
+  fi
+  if [ "$online_download_status" -ne 0 ]; then
+    CURRENT_STAGE="download"
+    note_error "온라인 업데이트를 받지 못했습니다. $UPDATE_LOG를 확인하세요."
+    write_status failed download "온라인 업데이트를 받지 못했습니다"
+    exit 1
+  fi
 fi
 
 # observer는 복사본으로 적용하므로 원래 ZIP 이름을 CURRENT_PACKAGE로 넘긴다.
@@ -120,8 +162,9 @@ cleanup_online_package() {
 # 아직 아무것도 바꾸지 않은 단계의 실패. 이력만 남기고 끝낸다.
 fail_without_changes() {  # <message>
   log "❌ $1"
+  note_error "$1"
   write_status failed "$CURRENT_STAGE" "$1"
-  [ -f "$STAGING_DIR/version.json" ] && release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "" failed "$1" || true
+  [ -f "$STAGING_DIR/version.json" ] && release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "" failed "$1" "$RUN_ID" "$RUN_SOURCE" || true
   cleanup_staging
   cleanup_online_package
   exit 1
@@ -131,15 +174,17 @@ fail_without_changes() {  # <message>
 fail_with_rollback() {  # <message>
   local failure_message=$1
   log "❌ $failure_message → 이전 버전으로 되돌립니다."
+  note_error "$failure_message"
   CURRENT_STAGE="rollback"
   write_status running rollback "$failure_message. 이전 버전으로 되돌리는 중"
   rollback_changes
   local rollback_result="이전 버전으로 되돌렸습니다"
   if ! wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${ACS_SERVICES[@]}" >/dev/null; then
     rollback_result="되돌린 뒤에도 일부 서비스가 healthy가 아닙니다. docker compose 상태와 $UPDATE_LOG 로그를 확인하세요"
+    note_error "$rollback_result"
   fi
   write_status failed rollback "$failure_message. $rollback_result"
-  release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "" failed "$failure_message. $rollback_result" || true
+  release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "" failed "$failure_message. $rollback_result" "$RUN_ID" "$RUN_SOURCE" || true
   cleanup_staging
   cleanup_online_package
   exit 1
@@ -169,7 +214,7 @@ rollback_changes() {
   acs_compose restart api-gateway zenoh-router >/dev/null 2>&1 || true
 }
 
-log "════ 업데이트 시작: $CURRENT_PACKAGE (설치=$INSTALL_MODE, 강제=$FORCE_MODE)"
+log "════ 업데이트 시작: $CURRENT_PACKAGE (설치=$INSTALL_MODE, 강제=$FORCE_MODE, 출처=$RUN_SOURCE, 실행 ID=$RUN_ID)"
 write_heartbeat
 
 # ── wait_tasks(큰 ZIP을 풀기 전에 먼저 본다. 기다리는 동안 매 주기 다시 풀지 않게) ──
@@ -177,7 +222,7 @@ if [ "$INSTALL_MODE" -eq 0 ] && [ "$FORCE_MODE" -eq 0 ]; then
   CURRENT_STAGE="wait_tasks"
   active_count="$(active_task_count)"
   if [ "$active_count" = "unknown" ]; then
-    log "⚠️  Task 서비스가 응답하지 않습니다($ACS_GATEWAY_URL). 실행 중인 Task가 없다고 보고 진행합니다."
+    warn "Task 서비스가 응답하지 않습니다($ACS_GATEWAY_URL). 실행 중인 Task가 없다고 보고 진행합니다."
   elif [ "$active_count" -gt 0 ]; then
     log "실행 중인 Task ${active_count}개 → 끝나면 업데이트합니다."
     write_status waiting wait_tasks "$(waiting_message "$active_count")"
@@ -215,6 +260,7 @@ if [ -n "$IMAGES_ARCHIVE" ]; then
   docker load -i "$STAGING_DIR/$IMAGES_ARCHIVE" || fail_without_changes "이미지를 불러오지 못했습니다."
   IMAGE_TAG="$(release_tool get "$STAGING_DIR" images.tag)"
 else
+  write_status running images "설치된 이미지를 확인하는 중"
   IMAGE_TAG="$(release_tool installed-get "$INSTALLED_FILE" images_tag)"
   if [ -z "$IMAGE_TAG" ] && [ -f "$ACS_ROOT/.env" ]; then
     IMAGE_TAG="$(sed -n 's/^ACS_IMAGE_TAG=//p' "$ACS_ROOT/.env" | tail -n1)"
@@ -263,6 +309,10 @@ write_status running snapshot "이전 버전을 보관하는 중"
 snapshot_path="$(release_tool snapshot "$STAGING_DIR" "$ACS_ROOT" "$INSTALLED_FILE" "$DEPLOY_DIR/archives" "$BIN_ARCH" 2> "$STAGING_DIR.err")" \
   || fail_without_changes "이전 버전을 보관하지 못했습니다: $(tail -n 3 "$STAGING_DIR.err")"
 [ -n "$snapshot_path" ] && log "이전 버전 보관: $snapshot_path"
+# 보관본은 정책(활성 Scenario의 업데이트 전 버전 보관 개수, 기본 3개)만큼만 남긴다.
+while IFS= read -r removed_archive; do
+  [ -n "$removed_archive" ] && log "오래된 보관본 삭제: $removed_archive"
+done < <(release_tool prune-archives "$DEPLOY_DIR/archives" "$SETTINGS_FILE" 2>/dev/null)
 
 # ── runtime ──────────────────────────────────────
 CURRENT_STAGE="runtime"
@@ -352,7 +402,7 @@ fi
 
 # ── done ─────────────────────────────────────────
 CURRENT_STAGE="done"
-release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "$IMAGE_TAG" success "" || true
+release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "$IMAGE_TAG" success "" "$RUN_ID" "$RUN_SOURCE" || true
 write_status success done "$CURRENT_VERSION 적용 완료(서비스: ${UPDATED_SERVICES[*]:-없음})"
 cleanup_staging
 cleanup_online_package

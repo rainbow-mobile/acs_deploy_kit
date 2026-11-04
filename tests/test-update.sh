@@ -62,8 +62,26 @@ for argument in "$@"; do
     http://*|https://*) request_url="$argument" ;;
   esac
 done
+# 인터넷이 없는 현장: 릴리즈 채널 주소는 모두 연결 실패(6)
+if [ -n "${FAKE_ONLINE_OFFLINE:-}" ] && [[ "$request_url" == https://download.example/* || "$request_url" == https://diokjo4dtg1mp.cloudfront.net/* ]]; then
+  exit 6
+fi
+# 서비스별 최신 버전(<채널>/<서비스>/version.json)과 서비스 ZIP(<채널>/<서비스>/<버전>.zip)
+if [[ "$request_url" == */version.json ]] && [ -n "${FAKE_ONLINE_SERVICES_DIR:-}" ]; then
+  service_name="$(basename "$(dirname "$request_url")")"
+  [ -f "$FAKE_ONLINE_SERVICES_DIR/$service_name/version.json" ] || exit 22
+  cp "$FAKE_ONLINE_SERVICES_DIR/$service_name/version.json" "$output_path"; exit 0
+fi
+if [[ "$request_url" =~ /([a-z]+)/([0-9][0-9.]*)\.zip$ ]] && [ -n "${FAKE_ONLINE_SERVICES_DIR:-}" ]; then
+  service_package="$FAKE_ONLINE_SERVICES_DIR/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}.zip"
+  [ -f "$service_package" ] || exit 22
+  cp "$service_package" "$output_path"; exit 0
+fi
 if [[ "$request_url" == */latest.json ]] && [ -n "${FAKE_ONLINE_MANIFEST:-}" ]; then
   cp "$FAKE_ONLINE_MANIFEST" "$output_path"; exit 0
+fi
+if [[ "$request_url" == */acs-*-update.zip || "$request_url" == */acs-*-install.zip ]] && [ -n "${FAKE_FAIL_PACKAGE:-}" ] && [ -n "$output_path" ]; then
+  echo "partial" > "$output_path"; exit 18
 fi
 if [[ "$request_url" == */acs-*-update.zip || "$request_url" == */acs-*-install.zip ]] && [ -n "${FAKE_ONLINE_PACKAGE:-}" ]; then
   cp "$FAKE_ONLINE_PACKAGE" "$output_path"; exit 0
@@ -88,16 +106,18 @@ EOF
 # 가짜 릴리즈 ZIP을 만든다. <출력> <버전> <서비스,...> <이미지 태그 또는 -> [smc.conf 내용]
 make_release() {
   python3 -I - "$@" <<'PYEOF'
-import hashlib, json, sys, zipfile
+import hashlib, json, os, sys, zipfile
 output_path, version, services_csv, image_tag = sys.argv[1:5]
+# 서비스 ZIP은 매니페스트 version이 통합 버전이고 서비스 버전은 따로입니다(RELEASE_SERVICE_VERSION).
+service_version = os.environ.get("RELEASE_SERVICE_VERSION") or version
 smc_conf = sys.argv[5] if len(sys.argv) > 5 else "listen 13100;\n"
 entries = {}
 services = {}
 for service_name in services_csv.split(","):
     path = f"services/{service_name}/{service_name}.amd64.bin"
-    content = f"#!/bin/sh\necho {service_name} {version}\n".encode()
+    content = f"#!/bin/sh\necho {service_name} {service_version}\n".encode()
     entries[path] = content
-    services[service_name] = {"version": version, "path": path, "sha256": hashlib.sha256(content).hexdigest()}
+    services[service_name] = {"version": service_version, "path": path, "sha256": hashlib.sha256(content).hexdigest()}
 runtime_files = {
     "compose.yml": b"services: {}\n", "compose.offline.yml": f"# {version}\n".encode(), ".env": b"TASK_PORT=18002\n",
     "site.env.example": b"# example\nPOSTGRES_PASSWORD=change-me\nFRS_API_BASE_URL=http://192.168.60.200:3000\nSMC_MOMS_URL=http://mock:18006\n",
@@ -126,6 +146,10 @@ json_value() {  # <파일> <키 경로(점 구분)>
   python3 -I -c 'import json,sys; value=json.load(open(sys.argv[1]))
 for key in sys.argv[2].split("."): value=value[int(key)] if isinstance(value,list) else value.get(key) if isinstance(value,dict) else None
 print("" if value is None else value)' "$1" "$2"
+}
+
+latest_run() {  # 가장 최근 실행 기록 파일
+  ls -t "$ACS_ROOT"/deploy/runs/*.json 2>/dev/null | head -n1
 }
 
 assert_equal() {  # <설명> <기대> <실제>
@@ -181,6 +205,15 @@ assert_true "현장 서버 블록 보존" grep -q "현장 수정" "$ACS_ROOT/api
 assert_true "업데이트 전 DB 백업" bash -c "ls '$ACS_ROOT'/backups/*-v2/mongo.archive.gz >/dev/null"
 assert_true "task 재시작" grep -q "restart task" "$FAKE_LOG"
 assert_true "바뀐 설정이 없으면 Gateway 재시작 안 함" bash -c "! grep -q 'restart task api-gateway' '$FAKE_LOG'"
+cli_run="$(latest_run)"
+assert_equal "직접 실행 출처" "cli" "$(json_value "$cli_run" source)"
+assert_equal "직접 실행 결과" "success" "$(json_value "$cli_run" result)"
+assert_equal "실행 기록 버전" "v2" "$(json_value "$cli_run" version)"
+assert_equal "단계 진행(validate → … → done)" "validate images backup snapshot runtime swap restart health done" \
+  "$(python3 -I -c 'import json,sys; print(" ".join(stage["stage"] for stage in json.load(open(sys.argv[1]))["stages"]))' "$cli_run")"
+assert_true "끝난 단계에 끝난 시각" test -n "$(json_value "$cli_run" stages.0.ended_at)"
+assert_equal "이력에 실행 ID" "$(json_value "$cli_run" run_id)" "$(json_value "$ACS_ROOT/deploy/installed.json" history.-1.run_id)"
+assert_equal "이력에 출처" "cli" "$(json_value "$ACS_ROOT/deploy/installed.json" history.-1.source)"
 
 echo "▶ 업데이트 전 상태를 버전을 적은 보관본 ZIP으로 남기고, 그 ZIP으로 되돌릴 수 있음"
 snapshot_path="$(ls "$ACS_ROOT"/deploy/archives/acs-rollback-v1-before-v2-*.zip 2>/dev/null | head -n1)"
@@ -223,6 +256,12 @@ assert_equal "실패 상태" "failed" "$(json_value "$ACS_ROOT/deploy/status.jso
 assert_true "실패 메시지에 sha256" grep -q "sha256" "$ACS_ROOT/deploy/status.json"
 assert_true "state bin은 v1 그대로" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
 assert_equal "실패 이력" "failed" "$(json_value "$ACS_ROOT/deploy/installed.json" history.-1.result)"
+failed_run="$(latest_run)"
+assert_equal "실패 실행 결과" "failed" "$(json_value "$failed_run" result)"
+assert_equal "멈춘 단계" "validate" "$(json_value "$failed_run" stopped_stage)"
+failed_error="$(python3 -I -c 'import json,sys; print(" ".join(note["message"] for note in json.load(open(sys.argv[1]))["notes"] if note["level"] == "error"))' "$failed_run")"
+assert_true "에러 기록에 sha256" bash -c "echo '$failed_error' | grep -q sha256"
+assert_equal "Task 서비스 무응답은 경고로 기록" "warning" "$(json_value "$failed_run" notes.0.level)"
 
 echo "▶ 실행 중인 Task가 있으면 대기(75), 강제 적용은 진행"
 echo '[{"state":"running"},{"state":"completed"}]' > "$FAKE_STATE_DIR/executions.json"
@@ -242,6 +281,7 @@ assert_true "task bin은 v2로 되돌림" grep -q "task v2" "$ACS_ROOT/services/
 assert_equal "실패 단계" "rollback" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
 assert_true "실패 메시지에 서비스" grep -q "task:unhealthy" "$ACS_ROOT/deploy/status.json"
 assert_equal "설치 버전은 그대로" "v3" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+assert_equal "되돌린 실행의 멈춘 단계는 health" "health" "$(json_value "$(latest_run)" stopped_stage)"
 rm -f "$FAKE_STATE_DIR/unhealthy-task"
 
 echo "▶ 필요한 이미지가 없으면 바꾸기 전에 멈춤"
@@ -252,9 +292,15 @@ assert_true "task bin은 v2 그대로" grep -q "task v2" "$ACS_ROOT/services/tas
 rm -f "$FAKE_STATE_DIR/missing-image"
 
 echo "▶ observer: 성공 ZIP은 지우고, 대기 ZIP은 두고, 실패 ZIP은 failed/로"
+echo '{"source": "ui-upload"}' > "$ACS_ROOT/deploy/observe/acs-v4-task.zip.meta.json"
 cp "$TEST_ROOT/acs-v4-task.zip" "$ACS_ROOT/deploy/observe/acs-v4-task.zip"
+echo '{"archive_keep_count": 1}' > "$ACS_ROOT/deploy/settings.json"
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "적용한 ZIP 삭제" test ! -e "$ACS_ROOT/deploy/observe/acs-v4-task.zip"
+assert_true "적용한 ZIP의 출처 파일 삭제" test ! -e "$ACS_ROOT/deploy/observe/acs-v4-task.zip.meta.json"
+assert_equal "UI 업로드 출처" "ui-upload" "$(json_value "$(latest_run)" source)"
+assert_equal "정책 보관 개수(1)만 남김" "1" "$(ls "$ACS_ROOT"/deploy/archives/acs-rollback-*.zip | wc -l | tr -d ' ')"
+rm -f "$ACS_ROOT/deploy/settings.json"
 assert_true "task bin은 v4" grep -q "task v4" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "heartbeat 기록" test -f "$ACS_ROOT/deploy/observer.json"
 echo '[{"state":"action_required"}]' > "$FAKE_STATE_DIR/executions.json"
@@ -263,9 +309,15 @@ cp "$TEST_ROOT/acs-v5-task.zip" "$ACS_ROOT/deploy/observe/acs-v5-task.zip"
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "대기 ZIP은 남김" test -f "$ACS_ROOT/deploy/observe/acs-v5-task.zip"
 assert_equal "observer 대기 상태" "waiting" "$(json_value "$ACS_ROOT/deploy/status.json" state)"
+waiting_run_id="$(json_value "$ACS_ROOT/deploy/observe/acs-v5-task.zip.meta.json" run_id)"
+assert_equal "직접 넣은 ZIP 출처" "offline-file" "$(json_value "$ACS_ROOT/deploy/runs/$waiting_run_id.json" source)"
+assert_equal "대기 중 실행 결과" "waiting" "$(json_value "$ACS_ROOT/deploy/runs/$waiting_run_id.json" result)"
 touch "$ACS_ROOT/deploy/observe/acs-v5-task.zip.force"
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "강제 표시가 있으면 적용" grep -q "task v5" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_equal "대기 뒤 적용은 같은 실행 기록에 이어서" "success" "$(json_value "$ACS_ROOT/deploy/runs/$waiting_run_id.json" result)"
+assert_equal "감지부터 남음" "detected" "$(json_value "$ACS_ROOT/deploy/runs/$waiting_run_id.json" stages.0.stage)"
+assert_equal "대기 단계 기록" "wait_tasks" "$(json_value "$ACS_ROOT/deploy/runs/$waiting_run_id.json" stages.1.stage)"
 assert_true "강제 표시 삭제" test ! -e "$ACS_ROOT/deploy/observe/acs-v5-task.zip.force"
 rm -f "$FAKE_STATE_DIR/executions.json"
 cp "$TEST_ROOT/acs-v3-broken.zip" "$ACS_ROOT/deploy/observe/acs-v3-broken.zip"
@@ -273,8 +325,22 @@ bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "실패 ZIP은 failed/로" test -f "$ACS_ROOT/deploy/failed/acs-v3-broken.zip"
 assert_true "실패 ZIP은 observe/에서 빠짐" test ! -e "$ACS_ROOT/deploy/observe/acs-v3-broken.zip"
 assert_equal "status의 ZIP 이름은 원래 이름" "acs-v3-broken.zip" "$(json_value "$ACS_ROOT/deploy/status.json" package)"
+# 엔진이 단계 기록 없이 죽어도(옵션·설정 오류 등) failed/로 옮긴 이유가 실행 기록·상태·update.log에 남아야 한다.
+cat > "$TEST_ROOT/dying-update.sh" <<'EOF'
+#!/bin/bash
+echo "알 수 없는 옵션: --weird" >&2
+exit 2
+EOF
+cp "$TEST_ROOT/acs-v5-task.zip" "$ACS_ROOT/deploy/observe/acs-v5-silent.zip"
+ACS_UPDATE_SCRIPT="$TEST_ROOT/dying-update.sh" bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "기록 없이 죽은 ZIP도 failed/로" test -f "$ACS_ROOT/deploy/failed/acs-v5-silent.zip"
+assert_equal "기록 없이 죽어도 실행 결과는 실패" "failed" "$(json_value "$(latest_run)" result)"
+assert_true "실패 이유에 종료 코드와 stderr" bash -c "grep -q '종료 코드 2' '$(latest_run)' && grep -q '알 수 없는 옵션' '$(latest_run)'"
+assert_equal "상태도 실패" "failed" "$(json_value "$ACS_ROOT/deploy/status.json" state)"
+assert_true "update.log에도 이유" grep -q "acs-v5-silent.zip: 업데이트 엔진이 이유를 남기지 않고" "$ACS_ROOT/deploy/update.log"
+assert_true "stderr 임시 파일 정리" test ! -e "$ACS_ROOT/deploy/.update-stderr.log"
 
-echo "▶ 온라인 자동배포: 기본은 조회하지 않고, 명시적으로 켜면 새 버전만 검증 후 적용"
+echo "▶ 온라인 자동배포: 기본은 최신 버전 조회만 하고, 명시적으로 켜면 새 버전만 검증 후 적용"
 make_release "$TEST_ROOT/acs-v6-task-update.zip" 6.0.0 task -
 export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v6-task-update.zip"
 export FAKE_ONLINE_MANIFEST="$TEST_ROOT/latest.json"
@@ -284,10 +350,19 @@ cat > "$FAKE_ONLINE_MANIFEST" <<EOF
 EOF
 : > "$FAKE_LOG"
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
-assert_true "기본 설정에서는 latest.json을 조회하지 않음" bash -c "! grep -q 'latest.json' '$FAKE_LOG'"
+assert_true "기본 설정에서도 최신 버전은 조회(버전 탭 표시)" grep -q "latest.json" "$FAKE_LOG"
+assert_equal "조회한 최신 전체 버전" "6.0.0" "$(json_value "$ACS_ROOT/deploy/online.json" total.version)"
+assert_equal "새 버전 표시" "True" "$(json_value "$ACS_ROOT/deploy/online.json" total.newer)"
+assert_equal "자동 업데이트 꺼짐(현장 설정)" "False" "$(json_value "$ACS_ROOT/deploy/online.json" auto_update)"
 assert_true "기본 설정에서는 온라인 버전을 적용하지 않음" grep -q "task v5" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_equal "자동배포가 꺼져 있어도 --online 수동 적용" "0" "$(run_update --online)"
 assert_true "수동 온라인 새 버전 적용" grep -q "task 6.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_equal "수동 온라인 출처" "online-manual" "$(json_value "$(latest_run)" source)"
+assert_true "다운로드 완료와 걸린 시간 출력" grep -q "acs-v6-task-update.zip 완료" "$ACS_ROOT/deploy/update.log"
+: > "$FAKE_LOG"
+assert_equal "같은 버전이면 수동 온라인 업데이트는 받지 않고 끝" "0" "$(run_update --online)"
+assert_true "같은 버전이면 ZIP을 받지 않음" bash -c "! grep -q 'acs-v6-task-update.zip' '$FAKE_LOG'"
+assert_true "받은 파일을 남기지 않음" bash -c "! ls -A '$ACS_ROOT/deploy' | grep -q 'manual-online'"
 
 make_release "$TEST_ROOT/acs-v7-task-update.zip" 7.0.0 task -
 export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v7-task-update.zip"
@@ -304,6 +379,76 @@ assert_true "온라인 latest.json 조회" grep -q "latest.json" "$FAKE_LOG"
 assert_true "온라인 ZIP 다운로드" grep -q "acs-v7-task-update.zip" "$FAKE_LOG"
 assert_true "온라인 새 버전 적용" grep -q "task 7.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_equal "온라인 적용 버전 기록" "7.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+assert_equal "온라인 자동 출처" "online-auto" "$(json_value "$(latest_run)" source)"
+
+echo "▶ 버전 탭 온라인: 서비스별 최신 버전 표시, UI 요청으로 서비스·전체 업데이트, 자동 업데이트 켜고 끄기"
+export FAKE_ONLINE_SERVICES_DIR="$TEST_ROOT/online-services"
+mkdir -p "$FAKE_ONLINE_SERVICES_DIR/task" "$FAKE_ONLINE_SERVICES_DIR/state"
+RELEASE_SERVICE_VERSION=7.1.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.1.0.zip" 7.0.0 task -
+echo '{"new_version": "7.1.0", "git_commit": "abc1234"}' > "$FAKE_ONLINE_SERVICES_DIR/task/version.json"
+echo '{"new_version": "3.0.0", "git_commit": "abc1234"}' > "$FAKE_ONLINE_SERVICES_DIR/state/version.json"
+# 버전 탭에서 자동 업데이트를 끄면 현장 설정(ACS_ONLINE_AUTO_UPDATE=1)보다 우선한다.
+echo '{"enabled": false}' > "$ACS_ROOT/deploy/auto-update.json"
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_equal "서비스 최신 버전" "7.1.0" "$(json_value "$ACS_ROOT/deploy/online.json" services.task.version)"
+assert_equal "서비스 새 버전 표시" "True" "$(json_value "$ACS_ROOT/deploy/online.json" services.task.newer)"
+assert_equal "같은 버전 서비스는 새 버전 아님" "False" "$(json_value "$ACS_ROOT/deploy/online.json" services.state.newer)"
+assert_equal "서비스 ZIP 경로" "task/7.1.0.zip" "$(json_value "$ACS_ROOT/deploy/online.json" services.task.path)"
+assert_equal "UI에서 끈 자동 업데이트" "False" "$(json_value "$ACS_ROOT/deploy/online.json" auto_update)"
+assert_equal "자동 업데이트 설정 출처" "ui" "$(json_value "$ACS_ROOT/deploy/online.json" auto_update_source)"
+assert_true "자동 업데이트를 끄면 새 서비스 버전도 적용하지 않음" grep -q "task 7.0.0" "$ACS_ROOT/services/task/task.amd64.bin"
+
+mkdir -p "$ACS_ROOT/deploy/requests"
+echo '{"kind": "update", "target": "task", "force": false}' > "$ACS_ROOT/deploy/requests/1000-update.json"
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "UI 요청으로 task만 온라인 업데이트" grep -q "task 7.1.0" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_true "다른 서비스는 그대로" grep -q "state v3" "$ACS_ROOT/services/state/state.amd64.bin"
+assert_equal "서비스 업데이트 뒤 전체 버전은 통합 버전 그대로" "7.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+assert_equal "UI 온라인 출처" "ui-online" "$(json_value "$(latest_run)" source)"
+assert_equal "다운로드 단계부터 기록" "download" "$(json_value "$(latest_run)" stages.0.stage)"
+assert_true "처리한 요청 삭제" test ! -e "$ACS_ROOT/deploy/requests/1000-update.json"
+assert_equal "적용 뒤 바로 다시 조회해 새 버전 표시를 끔" "False" "$(json_value "$ACS_ROOT/deploy/online.json" services.task.newer)"
+
+echo '{"kind": "check"}' > "$ACS_ROOT/deploy/requests/1001-check.json"
+: > "$FAKE_LOG"
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "다시 확인 요청은 바로 조회" grep -q "task/version.json" "$FAKE_LOG"
+assert_true "확인 요청 삭제" test ! -e "$ACS_ROOT/deploy/requests/1001-check.json"
+
+# sha256이 있는 서비스 version.json이면 받은 ZIP을 검증한다.
+RELEASE_SERVICE_VERSION=7.2.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.2.0.zip" 7.0.0 task -
+echo '{"new_version": "7.2.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}' > "$FAKE_ONLINE_SERVICES_DIR/task/version.json"
+echo '{"kind": "check"}' > "$ACS_ROOT/deploy/requests/1002-check.json"
+echo '{"kind": "update", "target": "task", "force": true}' > "$ACS_ROOT/deploy/requests/1003-update.json"
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_equal "sha256이 다르면 실패" "failed" "$(json_value "$ACS_ROOT/deploy/status.json" state)"
+assert_true "sha256이 다르면 적용하지 않음" grep -q "task 7.1.0" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_true "sha256이 다른 ZIP은 남기지 않음" bash -c "! ls '$ACS_ROOT'/deploy/observe/ | grep -q ."
+assert_equal "실패도 실행 기록에" "failed" "$(json_value "$(latest_run)" result)"
+
+# 자동 업데이트를 켜면 새 서비스 버전을 스스로 받아 적용한다.
+task_sha="$(sha256sum "$FAKE_ONLINE_SERVICES_DIR/task/7.2.0.zip" | cut -d' ' -f1)"
+echo "{\"new_version\": \"7.2.0\", \"sha256\": \"$task_sha\"}" > "$FAKE_ONLINE_SERVICES_DIR/task/version.json"
+echo '{"enabled": true}' > "$ACS_ROOT/deploy/auto-update.json"
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "자동 업데이트를 켜면 새 서비스 버전 적용" grep -q "task 7.2.0" "$ACS_ROOT/services/task/task.amd64.bin"
+assert_equal "자동 업데이트 출처" "online-auto" "$(json_value "$(latest_run)" source)"
+: > "$FAKE_LOG"
+bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "같은 버전은 다시 받지 않음" bash -c "! grep -q '7.2.0.zip' '$FAKE_LOG'"
+
+# 인터넷이 없으면 짧게 포기하고 연결 안 됨을 남긴다(observer 주기를 오래 막지 않음).
+: > "$FAKE_LOG"
+FAKE_ONLINE_OFFLINE=1 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_equal "인터넷 없음 표시" "False" "$(json_value "$ACS_ROOT/deploy/online.json" reachable)"
+assert_true "연결 오류 이유" test -n "$(json_value "$ACS_ROOT/deploy/online.json" error)"
+assert_true "두 번 실패하면 나머지 서비스는 묻지 않음" test "$(grep -c 'download.example' "$FAKE_LOG")" -le 2
+# 온라인 조회를 끈 현장(ACS_ONLINE_CHECK=0)은 네트워크를 쓰지 않는다.
+: > "$FAKE_LOG"
+ACS_ONLINE_CHECK=0 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_true "온라인 조회를 끄면 조회하지 않음" bash -c "! grep -q 'download.example' '$FAKE_LOG'"
+rm -f "$ACS_ROOT/deploy/auto-update.json"
+unset FAKE_ONLINE_SERVICES_DIR
 
 echo "▶ deploy.sh(기본 온라인): --input 없이 최신 설치용 ZIP을 받아 최초 설치"
 online_install_root="$TEST_ROOT/rb-acs-online"
@@ -320,6 +465,21 @@ assert_equal "온라인 최초 설치 종료 코드" "0" "$?"
 assert_equal "온라인 최초 설치 버전" "8.0.0" "$(json_value "$online_install_root/deploy/installed.json" version)"
 assert_true "온라인 최초 설치는 install ZIP 다운로드" grep -q "acs-v8-install.zip" "$FAKE_LOG"
 assert_true "--mode=develop은 develop 채널 latest.json" grep -q "acs/develop/latest.json" "$FAKE_LOG"
+assert_true "설치 뒤 받은 ZIP을 지움" test ! -e "$online_install_root/.download"
+: > "$FAKE_LOG"
+ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --root="$online_install_root" \
+  --project=rb-acs-online-test --no-systemd >/dev/null 2>&1
+assert_equal "이미 최신이면 deploy.sh 종료 코드" "0" "$?"
+assert_true "이미 최신이면 설치 ZIP을 받지 않음" bash -c "! grep -q 'acs-v8-install.zip' '$FAKE_LOG'"
+: > "$FAKE_LOG"
+ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --root="$online_install_root" \
+  --project=rb-acs-online-test --reinstall --no-systemd >/dev/null 2>&1
+assert_true "--reinstall이면 같은 버전도 다시 받음" grep -q "acs-v8-install.zip" "$FAKE_LOG"
+failed_install_root="$TEST_ROOT/rb-acs-failed-download"
+FAKE_FAIL_PACKAGE=1 ACS_ENV_FILE="$TEST_ROOT/etc/acs-failed-env.conf" bash "$KIT_DIR/deploy.sh" --root="$failed_install_root" \
+  --project=rb-acs-failed-test --no-systemd >/dev/null 2>&1
+assert_equal "다운로드 실패 종료 코드" "1" "$?"
+assert_true "다운로드 실패 시 받던 파일을 지움" test ! -e "$failed_install_root/.download"
 assert_equal "--mode 채널 기록" "develop" "$(bash -c '. "$1"; echo "$ACS_RELEASE_CHANNEL"' _ "$online_install_env")"
 bash "$KIT_DIR/deploy.sh" "$TEST_ROOT/acs-v1.zip" --no-systemd >/dev/null 2>&1
 assert_equal "위치 인자 ZIP은 --input 안내 후 거절" "2" "$?"
@@ -351,6 +511,14 @@ assert_true "docker 그룹 추가" grep -q "sudo usermod -aG docker" "$FAKE_LOG"
 assert_true "sg docker로 다시 실행" grep -q "sg docker" "$FAKE_LOG"
 assert_true "다시 실행한 쪽이 설치 완료" test -f "$TEST_ROOT/rb-acs-group/deploy/installed.json"
 rm -f "$FAKE_STATE_DIR/docker-needs-group"
+
+echo "▶ 예전 이름(acs-observer.sh·acs-update.sh·lib/release_tool.py)으로 설치한 현장도 키트만 받으면 계속 동작"
+: > "$FAKE_LOG"
+bash "$KIT_DIR/acs-observer.sh" --once >/dev/null 2>&1
+assert_equal "옛 observer 경로 종료 코드" "0" "$?"
+assert_true "옛 observer 경로도 heartbeat 기록" test -f "$ACS_ROOT/deploy/observer.json"
+assert_equal "옛 release_tool 경로" "true" "$(python3 -I "$KIT_DIR/lib/release_tool.py" version-is-newer 1.0.1 0.1.2)"
+assert_equal "옛 update 경로는 사용법 오류(2)로 새 update.sh에 넘김" "2" "$(bash "$KIT_DIR/acs-update.sh" >/dev/null 2>&1; echo $?)"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

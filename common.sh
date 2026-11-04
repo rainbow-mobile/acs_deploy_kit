@@ -20,8 +20,12 @@ load_acs_env() {
   ACS_PROJECT="${ACS_PROJECT:-rb-acs}"
   # 실행 중 Task 확인에 쓰는 Gateway 주소(호스트에서 접속).
   ACS_GATEWAY_URL="${ACS_GATEWAY_URL:-http://127.0.0.1:13000}"
-  # 온라인 자동배포는 명시적으로 1을 설정한 현장만 사용한다.
+  # 온라인 자동배포는 명시적으로 1을 설정한 현장만 사용한다. 버전 탭에서 켜고 끄면(deploy/auto-update.json) 그 값이 우선한다.
   ACS_ONLINE_AUTO_UPDATE="${ACS_ONLINE_AUTO_UPDATE:-0}"
+  # 온라인 최신 버전 조회(버전 탭 표시). 인터넷이 없어도 짧게 실패하고 넘어간다. 네트워크를 아예 쓰지 않을 현장만 0.
+  ACS_ONLINE_CHECK="${ACS_ONLINE_CHECK:-1}"
+  # 온라인 최신 버전을 다시 조회하는 주기(초). 버전 탭 "다시 확인"은 바로 조회한다.
+  ONLINE_CHECK_INTERVAL_SEC="${ONLINE_CHECK_INTERVAL_SEC:-300}"
   ACS_RELEASE_CHANNEL="${ACS_RELEASE_CHANNEL:-main}"
   # rb_acs가 latest.json을 올린 S3/CloudFront 공개 URL(prefix 루트).
   ACS_RELEASE_BASE_URL="${ACS_RELEASE_BASE_URL:-$DEFAULT_RELEASE_ORIGIN/$ACS_RELEASE_CHANNEL}"
@@ -36,7 +40,14 @@ load_acs_env() {
   OBSERVE_DIR="$DEPLOY_DIR/observe"
   STATUS_FILE="$DEPLOY_DIR/status.json"
   INSTALLED_FILE="$DEPLOY_DIR/installed.json"
+  # 업데이트 실행 기록과 Common이 쓰는 설정(정책: 보관 개수)입니다.
+  RUNS_DIR="$DEPLOY_DIR/runs"
+  SETTINGS_FILE="$DEPLOY_DIR/settings.json"
   HEARTBEAT_FILE="$DEPLOY_DIR/observer.json"
+  # 온라인 최신 버전(observer가 씀), 버전 탭 요청(Common이 씀: 다시 확인·온라인 업데이트), 버전 탭 자동 업데이트 설정(Common이 씀)입니다.
+  ONLINE_FILE="$DEPLOY_DIR/online.json"
+  REQUESTS_DIR="$DEPLOY_DIR/requests"
+  AUTO_UPDATE_FILE="$DEPLOY_DIR/auto-update.json"
   UPDATE_LOG="$DEPLOY_DIR/update.log"
 }
 
@@ -54,12 +65,58 @@ release_tool() {
 }
 
 # curl이 있으면 사용하고, 최소 설치 현장에서는 Python 표준 라이브러리로 내려받는다.
-download_file() {  # <url> <output> <timeout_sec>
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time "$3" -H "Cache-Control: no-cache" -o "$2" "$1"
-  else
-    release_tool download "$1" "$2" "$3"
+# 다운로드 경과를 출력하는 간격(초)입니다.
+DOWNLOAD_PROGRESS_INTERVAL_SEC="${DOWNLOAD_PROGRESS_INTERVAL_SEC:-3}"
+
+format_duration() {  # <초>
+  if [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60)); else printf '%ds' "$1"; fi
+}
+
+download_file() {  # <url> <output> <timeout_sec> [progress]
+  # progress(1)를 주면 큰 ZIP처럼 오래 걸리는 다운로드의 받은 양·속도·경과·남은 시간을 몇 초마다 한 줄씩 출력한다.
+  # curl 진행 막대는 observer 로그에 제어 문자로 남으므로, curl은 조용히 돌리고 받은 파일 크기를 읽어 줄 단위로 찍는다.
+  # 중간에 실패하거나 Ctrl+C·종료 신호를 받으면 받던 파일을 지운다.
+  if ! command -v curl >/dev/null 2>&1; then
+    release_tool download "$1" "$2" "$3" "${4:-0}"
+    return
   fi
+  if [ "${4:-0}" != "1" ]; then
+    curl -fsS --max-time "$3" -H "Cache-Control: no-cache" -o "$2" "$1"
+    return
+  fi
+  local total_bytes download_pid download_status started_at received_bytes elapsed_seconds speed_bytes file_label progress_line
+  file_label="$(basename "$1")"
+  total_bytes="$(curl -fsSI --max-time 15 -H "Cache-Control: no-cache" "$1" 2>/dev/null \
+    | tr -d '\r' | awk 'tolower($1) == "content-length:" { size = $2 } END { print size + 0 }')"
+  rm -f "$2"
+  curl -fsS --max-time "$3" -H "Cache-Control: no-cache" -o "$2" "$1" &
+  download_pid=$!
+  # set -e 아래에서도 끝까지 지우도록 각 명령 실패를 무시하고, 값은 지금 풀어 둡니다.
+  trap "kill $download_pid 2>/dev/null || true; wait $download_pid 2>/dev/null || true; rm -f $(printf '%q' "$2"); exit 130" INT TERM
+  started_at=$SECONDS
+  while kill -0 "$download_pid" 2>/dev/null; do
+    sleep "$DOWNLOAD_PROGRESS_INTERVAL_SEC"
+    kill -0 "$download_pid" 2>/dev/null || break
+    received_bytes="$(stat -c %s "$2" 2>/dev/null || echo 0)"
+    elapsed_seconds=$((SECONDS - started_at))
+    speed_bytes=$((received_bytes / (elapsed_seconds > 0 ? elapsed_seconds : 1)))
+    progress_line="   📥 $file_label $((received_bytes / 1048576))"
+    if [ "$total_bytes" -gt 0 ]; then
+      progress_line="$progress_line/$((total_bytes / 1048576))MB $((received_bytes * 100 / total_bytes))%"
+      [ "$speed_bytes" -gt 0 ] && progress_line="$progress_line · 남은 시간 약 $(format_duration $(((total_bytes - received_bytes) / speed_bytes)))"
+    else
+      progress_line="${progress_line}MB"
+    fi
+    echo "$progress_line · $((speed_bytes / 1048576))MB/s · 경과 $(format_duration "$elapsed_seconds")"
+  done
+  download_status=0
+  wait "$download_pid" || download_status=$?
+  trap - INT TERM
+  if [ "$download_status" -ne 0 ]; then
+    rm -f "$2"
+    return "$download_status"
+  fi
+  echo "   📥 $file_label 완료 $(($(stat -c %s "$2" 2>/dev/null || echo 0) / 1048576))MB · 걸린 시간 $(format_duration $((SECONDS - started_at)))"
 }
 
 # 설치 디렉터리에서 ACS compose를 실행한다. 현장 덮어쓰기 compose.site.yml(포트 변경 등)이 있으면 마지막에 얹는다.
@@ -82,6 +139,23 @@ log() {
 # status.json을 쓴다. Common이 읽어 Debugger 버전 탭으로 보낸다.
 write_status() {  # <state> <stage> <message> [package] [version]
   release_tool write-status "$STATUS_FILE" "$1" "$2" "$3" "${4:-${CURRENT_PACKAGE:-}}" "${5:-${CURRENT_VERSION:-}}" || true
+  # 이번 업데이트 실행 기록(deploy/runs/<run_id>.json)에도 단계 진행을 남긴다. Debugger 버전 탭 이력이 읽는다.
+  [ -n "${RUN_FILE:-}" ] && release_tool run-stage "$RUN_FILE" "$1" "$2" "$3" "${5:-${CURRENT_VERSION:-}}" || true
+}
+
+# 경고를 로그와 실행 기록에 함께 남긴다.
+warn() {  # <message>
+  log "⚠️  $1"
+  [ -n "${RUN_FILE:-}" ] && release_tool run-note "$RUN_FILE" warning "${CURRENT_STAGE:-}" "$1" || true
+}
+
+# 에러를 실행 기록에 남긴다(로그는 부르는 쪽이 남김).
+note_error() {  # <message>
+  [ -n "${RUN_FILE:-}" ] && release_tool run-note "$RUN_FILE" error "${CURRENT_STAGE:-}" "$1" || true
+}
+
+new_run_id() {
+  echo "$(date '+%Y%m%d-%H%M%S')-$$"
 }
 
 # observer heartbeat. 업데이트 엔진도 오래 걸리는 단계마다 갱신해 화면이 observer를 멈춘 것으로 보지 않게 한다.
