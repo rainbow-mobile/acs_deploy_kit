@@ -79,6 +79,8 @@ refresh_online_status() {
     "$auto_update_setting" "$auto_update_source" >/dev/null 2>&1 || true
   rm -rf "$check_dir"
   LAST_ONLINE_CHECK=$SECONDS
+  # 확인 결과를 한 줄 남긴다(observer 로그에서 주기 확인이 도는지 보이게).
+  log "🌐 온라인 버전 확인($ACS_RELEASE_CHANNEL): $(release_tool online-describe "$ONLINE_FILE" 2>/dev/null || echo "결과를 쓰지 못했습니다")"
 }
 
 # online.json의 대상(total 또는 서비스 이름)을 받아 sha256을 확인하고 observe/에 넣는다. 그 뒤 처리는 업로드 ZIP과 같다.
@@ -284,6 +286,8 @@ wait_for_next_check() {
   fi
 }
 
+# 이미 설치한 현장도 키트만 받고 observer를 다시 시작하면 acs 명령이 생기게 한다(observer는 root로 돈다).
+[ -w "$(dirname "$ACS_COMMAND_LINK")" ] && link_acs_command
 log "👀 ACS observer 시작: $OBSERVE_DIR (주기 ${CHECK_INTERVAL_SEC}초, inotify $(command -v inotifywait >/dev/null 2>&1 && echo 사용 || echo 없음))"
 while :; do
   # 설정 파일만 바꾸고 서비스를 재시작하지 않아도 다음 주기에 on/off와 URL이 반영된다.

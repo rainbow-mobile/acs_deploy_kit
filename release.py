@@ -16,6 +16,7 @@
     snapshot <staging> <acs_root> <installed.json> <archives_dir> <arch>  바뀔 서비스의 현재 bin·설정을 되돌리기용 릴리즈 ZIP으로 보관
     online-summary <check_dir> <installed.json> <online.json> <channel> <base_url> <auto_update> <auto_update_source>
                                                  observer가 받은 latest.json·서비스별 version.json으로 버전 탭 최신 버전 표시(online.json)
+    online-describe <online.json>                online.json을 observer 로그 한 줄로 요약
     online-next <online.json> <installed.json>   자동 업데이트할 대상(total 또는 서비스 이름, 없으면 빈 줄)
 """
 
@@ -503,9 +504,14 @@ def record(
     if result == "success":
         installed_services = installed.get("services") or {}
         for service_name, service_entry in (manifest.get("services") or {}).items():
-            installed_services[service_name] = {"version": service_entry["version"], "sha256": service_entry["sha256"], "installed_at": applied_at}
+            # 브랜치(온라인 채널)는 서비스마다 다를 수 있습니다(예: develop 서비스 ZIP을 main 현장에 적용). 예전 ZIP은 없습니다.
+            installed_services[service_name] = {
+                "version": service_entry["version"], "sha256": service_entry["sha256"], "installed_at": applied_at,
+                "branch": service_entry.get("branch") or manifest.get("branch"),
+            }
         installed.update({
             "version": manifest["version"], "git_commit": manifest.get("git_commit"), "installed_at": applied_at,
+            "branch": manifest.get("branch") or installed.get("branch"),
             "images_tag": images_tag, "services": installed_services,
         })
     history = installed.get("history") or []
@@ -611,12 +617,15 @@ def snapshot(staging_name: str, acs_root_name: str, installed_name: str, archive
         "kind": RELEASE_KIND,
         "format_version": SUPPORTED_FORMAT_VERSION,
         "version": previous_version,
+        "branch": installed.get("branch"),
         "created_at": taken_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git_commit": installed.get("git_commit"),
         "arch": architecture,
         "services": {
             service_name: {
                 "version": (installed_services.get(service_name) or {}).get("version") or previous_version,
+                # 되돌리면 그 서비스의 예전 브랜치로 기록되게 둡니다.
+                "branch": (installed_services.get(service_name) or {}).get("branch"),
                 "path": bin_relative_path,
                 "sha256": file_sha256(acs_root / bin_relative_path),
             }
@@ -721,6 +730,29 @@ def online_summary(
     })
 
 
+def online_describe(online_name: str) -> None:
+    """online.json을 observer 로그 한 줄로 요약해 출력합니다.
+
+    Args:
+        online_name (str): online.json 경로입니다.
+    """
+    online = read_json(Path(online_name))
+    if not online:
+        print("결과 없음")
+        return
+    if not online.get("reachable"):
+        reason = "채널에 배포된 버전 없음(404)" if online.get("error_kind") == "channel_empty" else "연결 실패"
+        print(f"{reason}: {str(online.get('error') or '').splitlines()[-1:] or ''}")
+        return
+    total = online.get("total") or {}
+    newer_names = [
+        f"{service_name} {service_entry.get('version')}"
+        for service_name, service_entry in sorted((online.get("services") or {}).items()) if service_entry.get("newer")
+    ]
+    total_text = f"최신 통합 {total.get('version')}{'(새 버전)' if total.get('newer') else ''}" if total else "통합 버전 없음"
+    print(f"{total_text} · 새 버전 서비스: {', '.join(newer_names) or '없음'}")
+
+
 def online_next(online_name: str, installed_name: str) -> None:
     """자동 업데이트할 대상을 출력합니다. 통합 버전이 새로우면 total, 아니면 새 버전이 있는 첫 서비스, 없으면 빈 줄입니다.
 
@@ -791,6 +823,8 @@ def main(arguments: list[str]) -> None:
         download(*command_arguments)
     elif command_name == "online-summary" and len(command_arguments) == 7:
         online_summary(*command_arguments)
+    elif command_name == "online-describe" and len(command_arguments) == 1:
+        online_describe(*command_arguments)
     elif command_name == "online-next" and len(command_arguments) == 2:
         online_next(*command_arguments)
     else:

@@ -49,6 +49,15 @@ load_acs_env() {
   REQUESTS_DIR="$DEPLOY_DIR/requests"
   AUTO_UPDATE_FILE="$DEPLOY_DIR/auto-update.json"
   UPDATE_LOG="$DEPLOY_DIR/update.log"
+  # 서비스 관리 명령(acs) 링크 위치. deploy.sh와 observer(root)가 키트의 acs.sh로 연결한다.
+  ACS_COMMAND_LINK="${ACS_COMMAND_LINK:-/usr/local/bin/acs}"
+}
+
+# acs 명령 링크를 이 키트의 acs.sh로 맞춘다. 이미 맞으면 아무것도 하지 않는다. 앞에 붙일 명령(sudo)을 인자로 받는다.
+link_acs_command() {  # [sudo]
+  local link_target="$KIT_DIR/acs.sh"
+  [ "$(readlink -f "$ACS_COMMAND_LINK" 2>/dev/null)" = "$link_target" ] && return 0
+  "$@" ln -sf "$link_target" "$ACS_COMMAND_LINK" 2>/dev/null
 }
 
 # 이 PC arch를 릴리즈 arch 이름으로 바꾼다. 서비스 bin은 지금 amd64만 있다.

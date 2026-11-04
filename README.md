@@ -7,6 +7,7 @@ deploy.sh     최초 설치와 observer 등록
 update.sh     ZIP 검증, 백업, 선택 서비스 교체, 실패 시 롤백
 observer.sh   Debugger에서 올린 ZIP 감시 후 update.sh 호출
 reset.sh      서비스와 observer 제거
+acs.sh        설치한 서비스 상태·실행·중지·재시작·로그 (`acs` 명령)
 
 common.sh     네 스크립트가 같이 쓰는 환경·compose 함수
 release.py    ZIP 검증과 버전 이력 처리
@@ -102,7 +103,7 @@ observer 자동 업데이트와 `update.sh --online`도 같은 채널을 봅니�
 | restart / health | 필요한 서비스만 재시작·상태 확인 | 직전 파일로 복원 후 재기동 |
 
 - 이전 버전은 `deploy/archives/acs-rollback-*.zip`에 남고 Debugger에서 다시 적용할 수 있습니다.
-- 버전과 성공·실패 이력은 `deploy/installed.json`에 남습니다.
+- 버전과 성공·실패 이력은 `deploy/installed.json`에 남습니다. 릴리즈 ZIP 매니페스트의 `branch`(빌드한 브랜치·온라인 채널)를 전체와 서비스별로 함께 기록합니다(예전 ZIP은 없음).
 - DB 백업은 `backups/`에 최근 3개를 유지합니다. DB 자체는 자동 롤백하지 않습니다.
 - 자동 복구 가능한 검사는 빌드 단계에서 먼저 고칩니다. 손상된 ZIP처럼 고칠 수 없는 오류는 기존 설치를 보존한 채 실패 처리합니다.
 
@@ -116,6 +117,24 @@ cat /설치경로/deploy/status.json
 ./reset.sh
 ./reset.sh --purge
 ```
+
+## 서비스 관리 명령 `acs` (2026-11-04)
+
+`deploy.sh`가 `/usr/local/bin/acs`를 키트의 `acs.sh`로 연결합니다. 이미 설치한 현장은 키트를 받고 observer를 다시 시작하면
+observer(root)가 연결해 둡니다(`sudo systemctl restart acs-update-observer`). 링크 위치는 `ACS_COMMAND_LINK`로 바꿀 수 있습니다.
+compose 파일·env 파일·프로젝트 이름은 업데이트 엔진과 같은 `common.sh`의 `acs_compose`를 씁니다.
+
+```bash
+acs                       # 상태: 설치 버전·업데이트 상태·observer·compose ps
+acs restart task state    # 일부 재시작 (서비스를 안 주면 전체)
+acs start | acs stop      # 전체 실행(up -d)·중지
+acs logs task             # 마지막 200줄부터 따라가며 보기
+acs version               # 전체·서비스별 설치 버전
+acs observer restart      # 업데이트 감시 재시작 (status·logs도 됨)
+```
+
+업데이트 엔진이 잠금(`deploy/.update.lock`)을 잡고 있는 동안에는 start·stop·restart를 거절합니다(종료 코드 75).
+엔진의 헬스체크·되돌리기와 겹치지 않게 하려는 것이고, 꼭 필요하면 `--force`를 붙입니다. 상태·로그 보기는 언제든 됩니다.
 
 ## 테스트
 

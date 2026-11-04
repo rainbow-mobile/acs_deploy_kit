@@ -35,6 +35,10 @@ if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/acs-update-o
   sudo systemctl daemon-reload
   echo "observer 등록을 지웠습니다."
 fi
+# 이 키트를 가리키는 acs 명령 링크만 지운다.
+if [ "$(readlink -f "$ACS_COMMAND_LINK" 2>/dev/null)" = "$SCRIPT_DIR/acs.sh" ]; then
+  sudo rm -f "$ACS_COMMAND_LINK" && echo "acs 명령 링크를 지웠습니다."
+fi
 
 if [ -f "$ACS_ROOT/compose.yml" ]; then
   if [ "$PURGE" -eq 1 ]; then

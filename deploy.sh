@@ -328,6 +328,8 @@ EOF
   sudo systemctl enable "$OBSERVER_SERVICE_NAME" >/dev/null
   sudo systemctl restart "$OBSERVER_SERVICE_NAME"
   echo "✅ $OBSERVER_SERVICE_NAME 서비스 등록 완료(로그: journalctl -u $OBSERVER_SERVICE_NAME -f)"
+  link_acs_command sudo && echo "✅ 서비스 관리 명령 등록: acs status|start|stop|restart|logs [서비스] ($ACS_COMMAND_LINK)" \
+    || echo "⚠️  acs 명령을 $ACS_COMMAND_LINK에 연결하지 못했습니다. 직접 실행: $SCRIPT_DIR/acs.sh"
 else
   echo "ℹ️  --no-systemd: observer를 등록하지 않았습니다. 직접 실행: ACS_ENV_FILE=$ACS_ENV_FILE bash $SCRIPT_DIR/observer.sh"
 fi
@@ -340,3 +342,4 @@ echo "  버전: $(release_tool installed-get "$INSTALLED_FILE" version)"
 echo "  Debugger: $ACS_GATEWAY_URL/state/debugger/  (버전 탭에서 업데이트 ZIP 업로드)"
 echo "  온라인 자동배포: $([ "$ACS_ONLINE_AUTO_UPDATE" = "1" ] && echo 사용 || echo 사용 안 함)"
 echo "  상태 파일: $STATUS_FILE"
+echo "  서비스 관리: acs status|start|stop|restart|logs [서비스]  (등록 안 됐으면 $SCRIPT_DIR/acs.sh)"

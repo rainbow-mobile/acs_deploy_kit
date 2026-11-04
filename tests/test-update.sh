@@ -98,6 +98,9 @@ export PATH="$FAKE_BIN_DIR:$PATH"
 
 # ── 설치 설정 ──
 export ACS_ENV_FILE="$TEST_ROOT/etc/acs-env.conf"
+# acs 명령 링크는 시험 디렉터리에 만든다(/usr/local/bin을 건드리지 않음).
+export ACS_COMMAND_LINK="$TEST_ROOT/bin/acs"
+mkdir -p "$TEST_ROOT/bin"
 export ACS_ROOT="$TEST_ROOT/rb-acs"
 export HEALTH_TIMEOUT_SEC=4
 mkdir -p "$(dirname "$ACS_ENV_FILE")"
@@ -114,6 +117,8 @@ import hashlib, json, os, sys, zipfile
 output_path, version, services_csv, image_tag = sys.argv[1:5]
 # 서비스 ZIP은 매니페스트 version이 통합 버전이고 서비스 버전은 따로입니다(RELEASE_SERVICE_VERSION).
 service_version = os.environ.get("RELEASE_SERVICE_VERSION") or version
+# 빌드한 브랜치(RELEASE_BRANCH). 예전 ZIP처럼 없을 수도 있습니다.
+release_branch = os.environ.get("RELEASE_BRANCH")
 smc_conf = sys.argv[5] if len(sys.argv) > 5 else "listen 13100;\n"
 entries = {}
 services = {}
@@ -134,7 +139,7 @@ if image_tag != "-":
     entries["images/acs-images.tar"] = b"image-tar"
     images = {"tag": image_tag, "names": [], "archive": "images/acs-images.tar", "sha256": hashlib.sha256(b"image-tar").hexdigest()}
 manifest = {
-    "kind": "acs.release", "format_version": 1, "version": version, "created_at": "2026-10-30T00:00:00Z", "git_commit": "abc1234",
+    "kind": "acs.release", "format_version": 1, "version": version, "branch": release_branch, "created_at": "2026-10-30T00:00:00Z", "git_commit": "abc1234",
     "arch": "amd64", "services": services,
     "runtime": {"path": "runtime", "files": {path: hashlib.sha256(content).hexdigest() for path, content in runtime_files.items()}},
     "images": images,
@@ -195,6 +200,40 @@ assert_true "최초 설치는 이전 버전 보관본이 없음" bash -c "! ls '
 assert_equal "온라인 자동배포 기본값은 꺼짐" "0" "$(bash -c '. "$1"; echo "$ACS_ONLINE_AUTO_UPDATE"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 채널" "main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_CHANNEL"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 주소" "https://diokjo4dtg1mp.cloudfront.net/acs/main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_BASE_URL"' _ "$ACS_ENV_FILE")"
+
+echo "▶ acs 명령: 설치한 서비스 상태·실행·중지·재시작·로그 (업데이트 중이면 거절)"
+: > "$FAKE_LOG"
+assert_equal "acs restart 종료 코드" "0" "$(bash "$KIT_DIR/acs.sh" restart task state >/dev/null 2>&1; echo $?)"
+assert_true "restart는 설치 compose로 지정 서비스만" grep -q "compose -p rb-acs-test --project-directory $ACS_ROOT .* restart task state" "$FAKE_LOG"
+assert_true "compose 파일·env 파일을 업데이트 엔진과 같게" grep -q -- "--env-file $ACS_ROOT/site.env -f $ACS_ROOT/compose.yml -f $ACS_ROOT/compose.offline.yml" "$FAKE_LOG"
+bash "$KIT_DIR/acs.sh" start >/dev/null 2>&1
+assert_true "start는 up -d" grep -q "compose .* up -d" "$FAKE_LOG"
+bash "$KIT_DIR/acs.sh" stop mock >/dev/null 2>&1
+assert_true "stop은 지정 서비스만" grep -q "compose .* stop mock" "$FAKE_LOG"
+bash "$KIT_DIR/acs.sh" logs task >/dev/null 2>&1
+assert_true "logs는 따라가며 마지막 줄부터" grep -q "compose .* logs -f --tail 200 task" "$FAKE_LOG"
+acs_status_output="$(bash "$KIT_DIR/acs.sh" 2>&1)"
+assert_true "인자 없으면 상태(ps)" grep -q "compose .* ps" "$FAKE_LOG"
+assert_true "상태에 설치 버전" grep -q "설치 버전: v1" <<< "$acs_status_output"
+assert_equal "모르는 서비스는 사용법 오류(2)" "2" "$(bash "$KIT_DIR/acs.sh" restart nosuch >/dev/null 2>&1; echo $?)"
+assert_equal "모르는 명령은 사용법 오류(2)" "2" "$(bash "$KIT_DIR/acs.sh" explode >/dev/null 2>&1; echo $?)"
+# 업데이트 엔진이 잠금을 잡고 있는 동안(업데이트 중)에는 실행·중지·재시작을 거절하고, --force면 진행한다.
+touch "$ACS_ROOT/deploy/.update.lock"
+flock "$ACS_ROOT/deploy/.update.lock" sleep 5 &
+update_lock_pid=$!
+sleep 0.3
+: > "$FAKE_LOG"
+assert_equal "업데이트 중 restart는 거절(75)" "75" "$(bash "$KIT_DIR/acs.sh" restart task >/dev/null 2>&1; echo $?)"
+assert_true "업데이트 중 restart는 compose를 부르지 않음" bash -c "! grep -q ' restart ' '$FAKE_LOG'"
+assert_equal "업데이트 중에도 상태 보기는 됨" "0" "$(bash "$KIT_DIR/acs.sh" status >/dev/null 2>&1; echo $?)"
+assert_equal "--force면 업데이트 중에도 진행" "0" "$(bash "$KIT_DIR/acs.sh" restart task --force >/dev/null 2>&1; echo $?)"
+# flock이 띄운 sleep이 잠금을 쥐고 있으므로 자식까지 끝낸다.
+pkill -P "$update_lock_pid" 2>/dev/null; kill "$update_lock_pid" 2>/dev/null; wait "$update_lock_pid" 2>/dev/null
+# deploy.sh가 /usr/local/bin/acs로 연결해 두므로 심볼릭 링크로 불러도 키트 폴더를 찾는다.
+ln -sf "$KIT_DIR/acs.sh" "$TEST_ROOT/acs"
+: > "$FAKE_LOG"
+assert_equal "링크로 불러도 동작" "0" "$(bash "$TEST_ROOT/acs" restart task >/dev/null 2>&1; echo $?)"
+assert_true "링크로 불러도 같은 compose" grep -q "restart task" "$FAKE_LOG"
 
 echo "▶ 현장 파일은 업데이트가 덮어쓰지 않음 + Task만 바꾸는 부분 업데이트"
 echo "listen 13105; # 현장 수정" > "$ACS_ROOT/api-gateway/servers/smc.conf"
@@ -307,6 +346,7 @@ assert_equal "정책 보관 개수(1)만 남김" "1" "$(ls "$ACS_ROOT"/deploy/ar
 rm -f "$ACS_ROOT/deploy/settings.json"
 assert_true "task bin은 v4" grep -q "task v4" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "heartbeat 기록" test -f "$ACS_ROOT/deploy/observer.json"
+assert_equal "observer가 acs 명령 링크를 키트로 맞춤(이미 설치한 현장)" "$KIT_DIR/acs.sh" "$(readlink -f "$ACS_COMMAND_LINK")"
 assert_true "heartbeat에 온라인 요청 처리 가능 표시(예전 키트와 구분)" grep -q '"online"' "$ACS_ROOT/deploy/observer.json"
 echo '[{"state":"action_required"}]' > "$FAKE_STATE_DIR/executions.json"
 make_release "$TEST_ROOT/acs-v5-task.zip" v5 task -
@@ -389,12 +429,14 @@ assert_equal "온라인 자동 출처" "online-auto" "$(json_value "$(latest_run
 echo "▶ 버전 탭 온라인: 서비스별 최신 버전 표시, UI 요청으로 서비스·전체 업데이트, 자동 업데이트 켜고 끄기"
 export FAKE_ONLINE_SERVICES_DIR="$TEST_ROOT/online-services"
 mkdir -p "$FAKE_ONLINE_SERVICES_DIR/task" "$FAKE_ONLINE_SERVICES_DIR/state"
-RELEASE_SERVICE_VERSION=7.1.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.1.0.zip" 7.0.0 task -
+RELEASE_BRANCH=develop RELEASE_SERVICE_VERSION=7.1.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.1.0.zip" 7.0.0 task -
 echo '{"new_version": "7.1.0", "git_commit": "abc1234"}' > "$FAKE_ONLINE_SERVICES_DIR/task/version.json"
 echo '{"new_version": "3.0.0", "git_commit": "abc1234"}' > "$FAKE_ONLINE_SERVICES_DIR/state/version.json"
 # 버전 탭에서 자동 업데이트를 끄면 현장 설정(ACS_ONLINE_AUTO_UPDATE=1)보다 우선한다.
 echo '{"enabled": false}' > "$ACS_ROOT/deploy/auto-update.json"
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+observer_output="$(bash "$KIT_DIR/observer.sh" --once 2>&1)"
+assert_true "온라인 확인 결과를 observer 로그에 한 줄로" bash -c 'grep -F "온라인 버전 확인" <<< "$1" | grep -qF "새 버전 서비스: task 7.1.0"' _ "$observer_output"
 assert_equal "서비스 최신 버전" "7.1.0" "$(json_value "$ACS_ROOT/deploy/online.json" services.task.version)"
 assert_equal "서비스 새 버전 표시" "True" "$(json_value "$ACS_ROOT/deploy/online.json" services.task.newer)"
 assert_equal "같은 버전 서비스는 새 버전 아님" "False" "$(json_value "$ACS_ROOT/deploy/online.json" services.state.newer)"
@@ -409,6 +451,10 @@ bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "UI 요청으로 task만 온라인 업데이트" grep -q "task 7.1.0" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "다른 서비스는 그대로" grep -q "state v3" "$ACS_ROOT/services/state/state.amd64.bin"
 assert_equal "서비스 업데이트 뒤 전체 버전은 통합 버전 그대로" "7.0.0" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+assert_equal "설치 브랜치 기록" "develop" "$(json_value "$ACS_ROOT/deploy/installed.json" branch)"
+assert_equal "서비스별 브랜치 기록" "develop" "$(json_value "$ACS_ROOT/deploy/installed.json" services.task.branch)"
+assert_equal "바꾸지 않은 서비스는 브랜치 모름(예전 ZIP)" "" "$(json_value "$ACS_ROOT/deploy/installed.json" services.state.branch)"
+assert_true "acs version에 브랜치" bash -c "bash '$KIT_DIR/acs.sh' version | grep -q '설치 버전: 7.0.0 (develop)'"
 assert_equal "UI 온라인 출처" "ui-online" "$(json_value "$(latest_run)" source)"
 assert_equal "다운로드 단계부터 기록" "download" "$(json_value "$(latest_run)" stages.0.stage)"
 assert_true "처리한 요청 삭제" test ! -e "$ACS_ROOT/deploy/requests/1000-update.json"
