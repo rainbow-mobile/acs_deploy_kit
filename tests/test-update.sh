@@ -62,6 +62,10 @@ for argument in "$@"; do
     http://*|https://*) request_url="$argument" ;;
   esac
 done
+# 인터넷은 되는데 배포한 적 없는 채널: 릴리즈 채널 주소는 모두 404(22)
+if [ -n "${FAKE_ONLINE_CHANNEL_EMPTY:-}" ] && [[ "$request_url" == https://download.example/* ]]; then
+  echo "curl: (22) The requested URL returned error: 404" >&2; exit 22
+fi
 # 인터넷이 없는 현장: 릴리즈 채널 주소는 모두 연결 실패(6)
 if [ -n "${FAKE_ONLINE_OFFLINE:-}" ] && [[ "$request_url" == https://download.example/* || "$request_url" == https://diokjo4dtg1mp.cloudfront.net/* ]]; then
   exit 6
@@ -303,6 +307,7 @@ assert_equal "정책 보관 개수(1)만 남김" "1" "$(ls "$ACS_ROOT"/deploy/ar
 rm -f "$ACS_ROOT/deploy/settings.json"
 assert_true "task bin은 v4" grep -q "task v4" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "heartbeat 기록" test -f "$ACS_ROOT/deploy/observer.json"
+assert_true "heartbeat에 온라인 요청 처리 가능 표시(예전 키트와 구분)" grep -q '"online"' "$ACS_ROOT/deploy/observer.json"
 echo '[{"state":"action_required"}]' > "$FAKE_STATE_DIR/executions.json"
 make_release "$TEST_ROOT/acs-v5-task.zip" v5 task -
 cp "$TEST_ROOT/acs-v5-task.zip" "$ACS_ROOT/deploy/observe/acs-v5-task.zip"
@@ -409,11 +414,15 @@ assert_equal "다운로드 단계부터 기록" "download" "$(json_value "$(late
 assert_true "처리한 요청 삭제" test ! -e "$ACS_ROOT/deploy/requests/1000-update.json"
 assert_equal "적용 뒤 바로 다시 조회해 새 버전 표시를 끔" "False" "$(json_value "$ACS_ROOT/deploy/online.json" services.task.newer)"
 
+# 예전 키트가 처리하지 못해 오래 남은 업데이트 요청은 키트를 바꾼 뒤 뜻밖에 적용되지 않게 버린다(다시 확인 요청은 해롭지 않아 처리).
+echo '{"kind": "update", "target": "task", "force": false, "requested_at": 1000}' > "$ACS_ROOT/deploy/requests/0999-update.json"
 echo '{"kind": "check"}' > "$ACS_ROOT/deploy/requests/1001-check.json"
 : > "$FAKE_LOG"
 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_true "다시 확인 요청은 바로 조회" grep -q "task/version.json" "$FAKE_LOG"
 assert_true "확인 요청 삭제" test ! -e "$ACS_ROOT/deploy/requests/1001-check.json"
+assert_true "오래된 업데이트 요청은 버림" test ! -e "$ACS_ROOT/deploy/requests/0999-update.json"
+assert_true "오래된 업데이트 요청은 적용하지 않음" grep -q "task 7.1.0" "$ACS_ROOT/services/task/task.amd64.bin"
 
 # sha256이 있는 서비스 version.json이면 받은 ZIP을 검증한다.
 RELEASE_SERVICE_VERSION=7.2.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.2.0.zip" 7.0.0 task -
@@ -443,6 +452,10 @@ FAKE_ONLINE_OFFLINE=1 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
 assert_equal "인터넷 없음 표시" "False" "$(json_value "$ACS_ROOT/deploy/online.json" reachable)"
 assert_true "연결 오류 이유" test -n "$(json_value "$ACS_ROOT/deploy/online.json" error)"
 assert_true "두 번 실패하면 나머지 서비스는 묻지 않음" test "$(grep -c 'download.example' "$FAKE_LOG")" -le 2
+assert_equal "연결 실패는 network" "network" "$(json_value "$ACS_ROOT/deploy/online.json" error_kind)"
+# 인터넷은 되는데 그 채널에 배포한 적이 없으면(404) 연결 실패와 구분한다.
+FAKE_ONLINE_CHANNEL_EMPTY=1 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1
+assert_equal "404만 나면 채널 비어 있음" "channel_empty" "$(json_value "$ACS_ROOT/deploy/online.json" error_kind)"
 # 온라인 조회를 끈 현장(ACS_ONLINE_CHECK=0)은 네트워크를 쓰지 않는다.
 : > "$FAKE_LOG"
 ACS_ONLINE_CHECK=0 bash "$KIT_DIR/observer.sh" --once >/dev/null 2>&1

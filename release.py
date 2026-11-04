@@ -50,6 +50,8 @@ RUN_SOURCES = ("ui-upload", "ui-rollback", "ui-online", "online-auto", "online-m
 # 버전 비교에 쓰는 세 자리 숫자 버전 형식입니다(v 접두사 허용). 태그 없이 만든 간이 배포는 `1.0.5-dev.202611041530`처럼
 # 뒤에 붙은 이름이 있고, 같은 번호의 정식 버전보다 낮게 봅니다(나중에 나온 1.0.5 정식 버전을 새 버전으로 알아봄).
 VERSION_PATTERN = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?$")
+# 이 키트 observer가 처리할 수 있는 기능입니다. heartbeat에 적어 화면·Common이 예전 키트와 구분합니다(online: 버전 탭 온라인 요청).
+OBSERVER_FEATURES = ("online",)
 # online.json에 남길 연결 오류 내용 길이입니다.
 ONLINE_ERROR_LIMIT = 300
 # 업데이트 전 버전 보관본 기본 개수입니다. Common이 활성 Scenario 정책 값을 deploy/settings.json에 적으면 그 값을 씁니다.
@@ -476,6 +478,7 @@ def write_heartbeat(heartbeat_name: str, interval_seconds: str) -> None:
     """
     write_json_atomic(Path(heartbeat_name), {
         "updated_at": int(time.time() * 1000), "interval_sec": int(interval_seconds), "host": socket.gethostname(), "pid": os.getppid(),
+        "features": list(OBSERVER_FEATURES),
     })
 
 
@@ -705,8 +708,13 @@ def online_summary(
         error_text = (check_directory / "error").read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         error_text = ""
+    # 받지 못한 이유가 모두 404면 인터넷은 되는데 그 채널에 배포한 적이 없는 것입니다(현장 --mode와 배포 브랜치가 다름).
+    error_lines = [error_line for error_line in error_text.splitlines() if error_line.strip()]
+    error_kind = None
+    if not reachable:
+        error_kind = "channel_empty" if error_lines and all("404" in error_line for error_line in error_lines) else "network"
     write_json_atomic(Path(online_name), {
-        "checked_at": utc_now_text(), "channel": channel, "base_url": base_url, "reachable": reachable,
+        "checked_at": utc_now_text(), "channel": channel, "base_url": base_url, "reachable": reachable, "error_kind": error_kind,
         "error": None if reachable else (error_text[-ONLINE_ERROR_LIMIT:] or "릴리즈 채널에 연결하지 못했습니다"),
         "auto_update": auto_update == "1", "auto_update_source": auto_update_source,
         "total": total, "services": services,

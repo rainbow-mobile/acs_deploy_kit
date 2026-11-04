@@ -33,6 +33,8 @@ mkdir -p "$OBSERVE_DIR" "$FAILED_DIR" "$REQUESTS_DIR"
 WAITING_PACKAGE=""
 # 마지막 온라인 조회 시각(SECONDS). -1이면 다음 주기에 바로 조회한다(시작·업데이트 직후).
 LAST_ONLINE_CHECK=-1
+# 이보다 오래된(밀리초) 온라인 업데이트 요청은 버린다. 예전 키트가 처리하지 못해 남은 요청이 키트를 바꾼 뒤 뜻밖에 적용되지 않게 한다.
+ONLINE_REQUEST_STALE_MS=600000
 
 # 가장 최근 ZIP. Common이 받는 중인 파일(.<이름>.part)은 .zip이 아니라 고르지 않는다.
 latest_package() {
@@ -143,7 +145,7 @@ fetch_online_target() {  # <target> <source> <force(1|0)>
 
 # 버전 탭 요청을 오래된 것부터 처리한다. 다시 확인은 한 번만 조회하고, 업데이트는 대기 중 ZIP이 없을 때 하나만 받는다.
 handle_online_requests() {
-  local request_path request_kind request_target request_force checked=0
+  local request_path request_kind request_target request_force request_requested_at checked=0
   while IFS= read -r request_path; do
     [ -n "$request_path" ] || continue
     request_kind="$(release_tool json-get "$request_path" kind 2>/dev/null)"
@@ -153,6 +155,12 @@ handle_online_requests() {
         [ "$checked" -eq 1 ] || { refresh_online_status; checked=1; }
         ;;
       update)
+        request_requested_at="$(release_tool json-get "$request_path" requested_at 2>/dev/null)"
+        if [[ "$request_requested_at" =~ ^[0-9]+$ ]] && [ $(( $(date +%s%3N) - request_requested_at )) -gt "$ONLINE_REQUEST_STALE_MS" ]; then
+          log "⚠️  오래된 온라인 업데이트 요청을 버립니다: $(basename "$request_path")"
+          rm -f "$request_path"
+          continue
+        fi
         [ -z "$(latest_package)" ] || continue
         request_target="$(release_tool json-get "$request_path" target 2>/dev/null)"
         request_force="$(release_tool json-get "$request_path" force 2>/dev/null)"
