@@ -47,8 +47,9 @@ HISTORY_LIMIT = 20
 RUN_LIMIT = 30
 # 업데이트 요청 출처입니다. Debugger 버전 탭이 이름으로 보여 줍니다.
 RUN_SOURCES = ("ui-upload", "ui-rollback", "ui-online", "online-auto", "online-manual", "offline-file", "cli", "install")
-# 버전 비교에 쓰는 세 자리 숫자 버전 형식입니다(v 접두사 허용).
-VERSION_PATTERN = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
+# 버전 비교에 쓰는 세 자리 숫자 버전 형식입니다(v 접두사 허용). 태그 없이 만든 간이 배포는 `1.0.5-dev.202611041530`처럼
+# 뒤에 붙은 이름이 있고, 같은 번호의 정식 버전보다 낮게 봅니다(나중에 나온 1.0.5 정식 버전을 새 버전으로 알아봄).
+VERSION_PATTERN = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?$")
 # online.json에 남길 연결 오류 내용 길이입니다.
 ONLINE_ERROR_LIMIT = 300
 # 업데이트 전 버전 보관본 기본 개수입니다. Common이 활성 Scenario 정책 값을 deploy/settings.json에 적으면 그 값을 씁니다.
@@ -143,9 +144,16 @@ def is_newer_version(candidate: str, installed: str) -> bool:
     installed_match = VERSION_PATTERN.fullmatch(installed)
     if not installed_match:
         return False
-    candidate_numbers = tuple(int(number or 0) for number in candidate_match.groups())
-    installed_numbers = tuple(int(number or 0) for number in installed_match.groups())
-    return candidate_numbers > installed_numbers
+    # (숫자 세 자리, 정식이면 1·뒤 이름이 있으면 0, 뒤 이름) 순서로 비교합니다.
+    candidate_key = (
+        tuple(int(number or 0) for number in candidate_match.groups()[:3]),
+        0 if candidate_match.group(4) else 1, candidate_match.group(4) or "",
+    )
+    installed_key = (
+        tuple(int(number or 0) for number in installed_match.groups()[:3]),
+        0 if installed_match.group(4) else 1, installed_match.group(4) or "",
+    )
+    return candidate_key > installed_key
 
 
 def version_is_newer(candidate: str, installed: str) -> None:

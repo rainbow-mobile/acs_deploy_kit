@@ -512,6 +512,11 @@ assert_true "sg docker로 다시 실행" grep -q "sg docker" "$FAKE_LOG"
 assert_true "다시 실행한 쪽이 설치 완료" test -f "$TEST_ROOT/rb-acs-group/deploy/installed.json"
 rm -f "$FAKE_STATE_DIR/docker-needs-group"
 
+echo "▶ 태그 없이 만든 간이 배포 버전(-dev.<시각>)은 같은 번호의 정식 버전보다 낮다"
+assert_equal "간이 배포 뒤 정식 버전은 새 버전" "true" "$(python3 -I "$KIT_DIR/release.py" version-is-newer 1.0.5 v1.0.5-dev.202611041530)"
+assert_equal "간이 배포 버전은 이전 정식 버전보다 높음" "true" "$(python3 -I "$KIT_DIR/release.py" version-is-newer 1.0.5-dev.202611041530 v1.0.4)"
+assert_equal "정식 버전에서 같은 번호 간이 버전은 낮음" "false" "$(python3 -I "$KIT_DIR/release.py" version-is-newer 1.0.5-dev.1 v1.0.5)"
+
 echo "▶ 예전 이름(acs-observer.sh·acs-update.sh·lib/release_tool.py)으로 설치한 현장도 키트만 받으면 계속 동작"
 : > "$FAKE_LOG"
 bash "$KIT_DIR/acs-observer.sh" --once >/dev/null 2>&1
