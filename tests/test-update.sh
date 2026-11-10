@@ -34,7 +34,7 @@ if [ "${1:-}" = "compose" ]; then
     *" exec -T api-gateway nginx -t "*) [ -f "$FAKE_STATE_DIR/gateway-config-fails" ] && exit 1; exit 0 ;;
     *" exec -T api-gateway nginx -s reload "*)
       [ -f "$FAKE_STATE_DIR/gateway-reload-fails" ] && exit 1
-      touch "$FAKE_STATE_DIR/gateway-check-pending"; exit 0 ;;
+      exit 0 ;;
     *" mongodump "*)
       [ -f "$FAKE_STATE_DIR/mongo-backup-fails" ] && exit 1
       if [ -f "$FAKE_STATE_DIR/mongo-auth-required" ]; then
@@ -103,16 +103,6 @@ if [[ "$request_url" == */acs-*-update.zip || "$request_url" == */acs-*-install.
 fi
 if [[ "$request_url" == */acs-*-update.zip || "$request_url" == */acs-*-install.zip ]] && [ -n "${FAKE_ONLINE_PACKAGE:-}" ]; then
   cp "$FAKE_ONLINE_PACKAGE" "$output_path"; exit 0
-fi
-# Gateway 갱신 후 조회는 별도 응답 파일 없이 정상으로 답하고, 오류·기동 지연도 재현합니다.
-if [[ "$request_url" == */task/execution/executions ]] && [ -f "$FAKE_STATE_DIR/gateway-check-pending" ]; then
-  [ -f "$FAKE_STATE_DIR/gateway-api-fails" ] && exit 22
-  if [ -f "$FAKE_STATE_DIR/gateway-api-delay" ] && [ ! -f "$FAKE_STATE_DIR/gateway-api-retried" ]; then
-    touch "$FAKE_STATE_DIR/gateway-api-retried"; exit 22
-  fi
-  rm -f "$FAKE_STATE_DIR/gateway-check-pending"
-  [ -f "$FAKE_STATE_DIR/executions.json" ] && cat "$FAKE_STATE_DIR/executions.json" || echo '[]'
-  exit 0
 fi
 [ -f "$FAKE_STATE_DIR/executions.json" ] && { cat "$FAKE_STATE_DIR/executions.json"; exit 0; }
 exit 7
@@ -386,32 +376,118 @@ assert_true "백업 실패 시 현장 환경설정 보존" cmp -s "$TEST_ROOT/si
 assert_true "백업 실패 시 서비스 재기동 없음" bash -c '! grep -Eq " (restart|up) " "$1"' _ "$FAKE_LOG"
 rm -f "$FAKE_STATE_DIR/mongo-auth-required" "$FAKE_STATE_DIR/mongo-backup-fails"
 
-echo "Gateway 갱신: 서비스 준비 후 주소 재조회와 실제 조회 응답 확인"
+echo "Gateway 갱신: 서비스 준비 후 설정 검사와 주소 갱신"
 : > "$FAKE_LOG"
 assert_equal "Gateway 갱신을 포함한 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
 assert_true "Gateway 설정 검사" grep -q 'exec -T api-gateway nginx -t' "$FAKE_LOG"
 assert_true "Gateway 설정 reload" grep -q 'exec -T api-gateway nginx -s reload' "$FAKE_LOG"
-assert_true "서비스 상태 확인 후 검사·reload·API 조회 순서" python3 -I -c 'import sys
+assert_true "서비스 상태 확인 후 검사·reload로 종료" python3 -I -c 'import sys
 commands=open(sys.argv[1]).read().splitlines()
 health=max(position for position,command in enumerate(commands) if "docker inspect " in command)
 check=next(position for position,command in enumerate(commands) if "exec -T api-gateway nginx -t" in command)
 reload=next(position for position,command in enumerate(commands) if "exec -T api-gateway nginx -s reload" in command)
-query=max(position for position,command in enumerate(commands) if "curl " in command and "/task/execution/executions" in command)
-assert health < check < reload < query' "$FAKE_LOG"
-touch "$FAKE_STATE_DIR/gateway-api-delay"
-assert_equal "Gateway 갱신 직후 일시적인 502는 재확인" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
-assert_true "일시적인 API 오류 뒤 재시도" test -f "$FAKE_STATE_DIR/gateway-api-retried"
-rm -f "$FAKE_STATE_DIR/gateway-api-delay" "$FAKE_STATE_DIR/gateway-api-retried"
+assert health < check < reload
+assert not any("curl " in command and "/task/execution/executions" in command for command in commands[reload+1:])' "$FAKE_LOG"
+
+echo "curl 없는 환경: Python 표준 라이브러리로 업데이트 전 Task 확인"
+python3 -I - "$KIT_DIR" "$TEST_ROOT" <<'PYEOF'
+import json, os, subprocess, sys, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+kit_directory, test_directory = map(Path, sys.argv[1:])
+request_paths = []
+
+class TaskHandler(BaseHTTPRequestHandler):
+    """실제 서비스 대신 로컬 시험용 Task API를 제공합니다."""
+
+    def do_GET(self) -> None:
+        """정상·실행 중·잘못된 응답·HTTP 오류를 반환합니다."""
+        request_paths.append(self.path)
+        payloads = {
+            "/idle/task/execution/executions": b"[]",
+            "/busy/task/execution/executions": b'[{"state":"running"},{"state":"completed"}]',
+            "/invalid/task/execution/executions": b"not-json",
+        }
+        self.send_response(200 if self.path in payloads else 503)
+        self.end_headers()
+        self.wfile.write(payloads.get(self.path, b"unavailable"))
+
+    def log_message(self, message: str, *arguments: object) -> None:
+        """시험 서버의 접속 로그를 생략합니다.
+
+        Args:
+            message (str): 기본 접속 로그 형식입니다.
+            *arguments (object): 로그 형식에 넣을 값입니다.
+        """
+
+shell_environment = test_directory / "no-curl.sh"
+shell_environment.write_text('''command() {
+  if [ "$#" -eq 2 ] && [ "$1" = -v ] && [ "$2" = curl ]; then return 1; fi
+  builtin command "$@"
+}
+curl() { return 127; }
+''')
+temporary_directory = test_directory / "no-curl-temporary"
+temporary_directory.mkdir()
+environment = dict(os.environ, BASH_ENV=str(shell_environment), TMPDIR=str(temporary_directory))
+server = ThreadingHTTPServer(("127.0.0.1", 0), TaskHandler)
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+base_url = f"http://127.0.0.1:{server.server_port}"
+results = {}
+try:
+    for response_name in ("idle", "busy", "invalid", "error"):
+        completed = subprocess.run(
+            ["bash", "-c", '. "$1/common.sh"; load_acs_env; ACS_GATEWAY_URL="$2"; active_task_count',
+             "_", str(kit_directory), f"{base_url}/{response_name}"],
+            env=environment, capture_output=True, text=True, timeout=15,
+        )
+        results[response_name] = completed.stdout.strip()
+    source_configuration = Path(os.environ["ACS_ENV_FILE"]).read_text()
+    configuration_path = test_directory / "no-curl.env"
+    for response_name, arguments in (
+        ("busy", []), ("update", []), ("install", ["--install"]),
+    ):
+        gateway_url = f"{base_url}/{'busy' if response_name == 'busy' else 'idle'}"
+        configuration_path.write_text(source_configuration + f'\nACS_GATEWAY_URL="{gateway_url}"\n')
+        previous_requests = len(request_paths)
+        completed = subprocess.run(
+            ["bash", str(kit_directory / "update.sh"), *arguments, str(test_directory / "acs-v2-task.zip")],
+            env=dict(environment, ACS_ENV_FILE=str(configuration_path)),
+            capture_output=True, text=True, timeout=45,
+        )
+        results[response_name + "Exit"] = str(completed.returncode)
+        results[response_name + "Requests"] = str(len(request_paths) - previous_requests)
+        (test_directory / ("no-curl-" + response_name + ".log")).write_text(completed.stdout + completed.stderr)
+    results["temporaryFiles"] = str(len(list(temporary_directory.iterdir())))
+    results["httpRequests"] = request_paths
+finally:
+    server.shutdown()
+    server.server_close()
+    server_thread.join()
+(test_directory / "no-curl-results.json").write_text(json.dumps(results))
+PYEOF
+assert_equal "curl 없이 Task 없음 조회" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" idle)"
+assert_equal "curl 없이 실행 중 Task 집계" "1" "$(json_value "$TEST_ROOT/no-curl-results.json" busy)"
+assert_equal "curl 없이 잘못된 응답은 unknown" "unknown" "$(json_value "$TEST_ROOT/no-curl-results.json" invalid)"
+assert_equal "curl 없이 HTTP 오류는 unknown" "unknown" "$(json_value "$TEST_ROOT/no-curl-results.json" error)"
+assert_equal "curl 없이 실행 중 Task가 있으면 대기" "75" "$(json_value "$TEST_ROOT/no-curl-results.json" busyExit)"
+assert_equal "curl 없이 일반 업데이트 성공" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" updateExit)"
+assert_equal "curl 없이 설치 모드 성공" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" installExit)"
+assert_equal "일반 업데이트는 시작 전에만 Task API 조회" "1" "$(json_value "$TEST_ROOT/no-curl-results.json" updateRequests)"
+assert_equal "설치 모드는 Task API를 조회하지 않음" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" installRequests)"
+assert_equal "Task 조회의 임시 파일 정리" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" temporaryFiles)"
 cp "$ACS_ROOT/services/state/state.amd64.bin" "$TEST_ROOT/state-before-gateway.bin"
 cp "$ACS_ROOT/deploy/installed.json" "$TEST_ROOT/installed-before-gateway.json"
-for failure in config reload api; do
+for failure in config reload; do
   touch "$FAKE_STATE_DIR/gateway-$failure-fails"
   : > "$FAKE_LOG"
   assert_equal "Gateway $failure 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v3-state.zip")"
   assert_equal "Gateway $failure 실패는 기존 복구 처리" "rollback" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
   assert_true "Gateway $failure 실패 시 이전 bin 복원" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
   assert_equal "Gateway $failure 실패 시 설치 버전 보존" "v2" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
-  rm -f "$FAKE_STATE_DIR/gateway-$failure-fails" "$FAKE_STATE_DIR/gateway-check-pending"
+  rm -f "$FAKE_STATE_DIR/gateway-$failure-fails"
   cp "$TEST_ROOT/state-before-gateway.bin" "$ACS_ROOT/services/state/state.amd64.bin"
   cp "$TEST_ROOT/installed-before-gateway.json" "$ACS_ROOT/deploy/installed.json"
 done
