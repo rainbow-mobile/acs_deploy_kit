@@ -106,6 +106,7 @@ observer 자동 업데이트와 `update.sh --online`도 같은 채널을 봅니�
 - 버전과 성공·실패 이력은 `deploy/installed.json`에 남습니다. 릴리즈 ZIP 매니페스트의 `branch`(빌드한 브랜치·온라인 채널)를 전체와 서비스별로 함께 기록합니다(예전 ZIP은 없음).
 - DB 백업은 `backups/`에 최근 3개를 유지합니다. DB 자체는 자동 롤백하지 않습니다.
 - MongoDB 백업은 기존 `site.env`에서 컨테이너로 전달된 `MONGO_INITDB_ROOT_USERNAME`·`MONGO_INITDB_ROOT_PASSWORD`로 `admin` DB에 인증합니다. 백업에 실패하면 설정·서비스 bin을 교체하기 전에 중단합니다.
+- 서비스 준비 후 Gateway 설정을 검사하고 reload하여 바뀐 컨테이너 주소를 다시 조회합니다. 기존 Task 조회 API가 정상 응답해야 성공으로 기록하며, 일시적인 응답 지연은 `HEALTH_TIMEOUT_SEC` 동안 재확인하고 실패하면 기존 복구 처리를 실행합니다.
 - 자동 복구 가능한 검사는 빌드 단계에서 먼저 고칩니다. 손상된 ZIP처럼 고칠 수 없는 오류는 기존 설치를 보존한 채 실패 처리합니다.
 
 ```bash

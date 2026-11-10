@@ -31,6 +31,10 @@ if [ "${1:-}" = "compose" ]; then
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
     *" ps -a --services "*|*" ps --services --status running "*) [ -f "$FAKE_STATE_DIR/containers-created" ] && printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres; exit 0 ;;
     *" up "*) touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
+    *" exec -T api-gateway nginx -t "*) [ -f "$FAKE_STATE_DIR/gateway-config-fails" ] && exit 1; exit 0 ;;
+    *" exec -T api-gateway nginx -s reload "*)
+      [ -f "$FAKE_STATE_DIR/gateway-reload-fails" ] && exit 1
+      touch "$FAKE_STATE_DIR/gateway-check-pending"; exit 0 ;;
     *" mongodump "*)
       [ -f "$FAKE_STATE_DIR/mongo-backup-fails" ] && exit 1
       if [ -f "$FAKE_STATE_DIR/mongo-auth-required" ]; then
@@ -99,6 +103,16 @@ if [[ "$request_url" == */acs-*-update.zip || "$request_url" == */acs-*-install.
 fi
 if [[ "$request_url" == */acs-*-update.zip || "$request_url" == */acs-*-install.zip ]] && [ -n "${FAKE_ONLINE_PACKAGE:-}" ]; then
   cp "$FAKE_ONLINE_PACKAGE" "$output_path"; exit 0
+fi
+# Gateway 갱신 후 조회는 별도 응답 파일 없이 정상으로 답하고, 오류·기동 지연도 재현합니다.
+if [[ "$request_url" == */task/execution/executions ]] && [ -f "$FAKE_STATE_DIR/gateway-check-pending" ]; then
+  [ -f "$FAKE_STATE_DIR/gateway-api-fails" ] && exit 22
+  if [ -f "$FAKE_STATE_DIR/gateway-api-delay" ] && [ ! -f "$FAKE_STATE_DIR/gateway-api-retried" ]; then
+    touch "$FAKE_STATE_DIR/gateway-api-retried"; exit 22
+  fi
+  rm -f "$FAKE_STATE_DIR/gateway-check-pending"
+  [ -f "$FAKE_STATE_DIR/executions.json" ] && cat "$FAKE_STATE_DIR/executions.json" || echo '[]'
+  exit 0
 fi
 [ -f "$FAKE_STATE_DIR/executions.json" ] && { cat "$FAKE_STATE_DIR/executions.json"; exit 0; }
 exit 7
@@ -329,6 +343,36 @@ assert_true "백업 실패 시 서비스 bin 보존" grep -q "state v1" "$ACS_RO
 assert_true "백업 실패 시 현장 환경설정 보존" cmp -s "$TEST_ROOT/site-before-mongo-failure.env" "$ACS_ROOT/site.env"
 assert_true "백업 실패 시 서비스 재기동 없음" bash -c '! grep -Eq " (restart|up) " "$1"' _ "$FAKE_LOG"
 rm -f "$FAKE_STATE_DIR/mongo-auth-required" "$FAKE_STATE_DIR/mongo-backup-fails"
+
+echo "Gateway 갱신: 서비스 준비 후 주소 재조회와 실제 조회 응답 확인"
+: > "$FAKE_LOG"
+assert_equal "Gateway 갱신을 포함한 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "Gateway 설정 검사" grep -q 'exec -T api-gateway nginx -t' "$FAKE_LOG"
+assert_true "Gateway 설정 reload" grep -q 'exec -T api-gateway nginx -s reload' "$FAKE_LOG"
+assert_true "서비스 상태 확인 후 검사·reload·API 조회 순서" python3 -I -c 'import sys
+commands=open(sys.argv[1]).read().splitlines()
+health=max(position for position,command in enumerate(commands) if "docker inspect " in command)
+check=next(position for position,command in enumerate(commands) if "exec -T api-gateway nginx -t" in command)
+reload=next(position for position,command in enumerate(commands) if "exec -T api-gateway nginx -s reload" in command)
+query=max(position for position,command in enumerate(commands) if "curl " in command and "/task/execution/executions" in command)
+assert health < check < reload < query' "$FAKE_LOG"
+touch "$FAKE_STATE_DIR/gateway-api-delay"
+assert_equal "Gateway 갱신 직후 일시적인 502는 재확인" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "일시적인 API 오류 뒤 재시도" test -f "$FAKE_STATE_DIR/gateway-api-retried"
+rm -f "$FAKE_STATE_DIR/gateway-api-delay" "$FAKE_STATE_DIR/gateway-api-retried"
+cp "$ACS_ROOT/services/state/state.amd64.bin" "$TEST_ROOT/state-before-gateway.bin"
+cp "$ACS_ROOT/deploy/installed.json" "$TEST_ROOT/installed-before-gateway.json"
+for failure in config reload api; do
+  touch "$FAKE_STATE_DIR/gateway-$failure-fails"
+  : > "$FAKE_LOG"
+  assert_equal "Gateway $failure 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v3-state.zip")"
+  assert_equal "Gateway $failure 실패는 기존 복구 처리" "rollback" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+  assert_true "Gateway $failure 실패 시 이전 bin 복원" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
+  assert_equal "Gateway $failure 실패 시 설치 버전 보존" "v2" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+  rm -f "$FAKE_STATE_DIR/gateway-$failure-fails" "$FAKE_STATE_DIR/gateway-check-pending"
+  cp "$TEST_ROOT/state-before-gateway.bin" "$ACS_ROOT/services/state/state.amd64.bin"
+  cp "$TEST_ROOT/installed-before-gateway.json" "$ACS_ROOT/deploy/installed.json"
+done
 
 echo "▶ sha256이 맞지 않으면 아무것도 바꾸지 않음"
 python3 -I - "$TEST_ROOT/acs-v3-state.zip" "$TEST_ROOT/acs-v3-broken.zip" <<'PYEOF'

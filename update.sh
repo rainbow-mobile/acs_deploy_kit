@@ -406,6 +406,18 @@ if ! unhealthy_services="$(wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${ACS_SE
   fail_with_rollback "헬스체크 실패(${HEALTH_TIMEOUT_SEC}초): $unhealthy_services"
 fi
 
+# 앱 재시작으로 바뀐 주소를 서비스 준비 후 다시 조회합니다.
+acs_compose exec -T api-gateway nginx -t || fail_with_rollback "Gateway 설정 검사에 실패했습니다"
+acs_compose exec -T api-gateway nginx -s reload || fail_with_rollback "Gateway 설정 갱신에 실패했습니다"
+gateway_deadline=$((SECONDS + HEALTH_TIMEOUT_SEC))
+while [ "$(active_task_count)" = "unknown" ]; do
+  if [ "$SECONDS" -ge "$gateway_deadline" ]; then
+    fail_with_rollback "Gateway API 응답 확인에 실패했습니다(${HEALTH_TIMEOUT_SEC}초)"
+  fi
+  write_heartbeat
+  sleep 3
+done
+
 # ── done ─────────────────────────────────────────
 CURRENT_STAGE="done"
 release_tool record "$INSTALLED_FILE" "$STAGING_DIR" "$IMAGE_TAG" success "" "$RUN_ID" "$RUN_SOURCE" || true
