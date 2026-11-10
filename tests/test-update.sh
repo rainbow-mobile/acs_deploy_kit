@@ -119,6 +119,8 @@ output_path, version, services_csv, image_tag = sys.argv[1:5]
 service_version = os.environ.get("RELEASE_SERVICE_VERSION") or version
 # 빌드한 브랜치(RELEASE_BRANCH). 예전 ZIP처럼 없을 수도 있습니다.
 release_branch = os.environ.get("RELEASE_BRANCH")
+# 묶음 종류(RELEASE_BUNDLE: total·service·quick). 없으면 예전 ZIP처럼 bundle을 적지 않습니다.
+release_bundle = os.environ.get("RELEASE_BUNDLE")
 smc_conf = sys.argv[5] if len(sys.argv) > 5 else "listen 13100;\n"
 entries = {}
 services = {}
@@ -144,6 +146,8 @@ manifest = {
     "runtime": {"path": "runtime", "files": {path: hashlib.sha256(content).hexdigest() for path, content in runtime_files.items()}},
     "images": images,
 }
+if release_bundle:
+    manifest["bundle"] = release_bundle
 with zipfile.ZipFile(output_path, "w") as archive:
     archive.writestr("version.json", json.dumps(manifest))
     for name, content in entries.items():
@@ -177,8 +181,9 @@ run_update() {  # update.sh 종료 코드를 돌려준다(출력은 숨김).
 
 ALL_SERVICES="common,scenario,task,state,external,map,mock"
 make_release "$TEST_ROOT/acs-v1.zip" v1 "$ALL_SERVICES" v1
-make_release "$TEST_ROOT/acs-v2-task.zip" v2 task - "listen 13199;\n"
-make_release "$TEST_ROOT/acs-v3-state.zip" v3 state -
+# 부분 ZIP이지만 통합 버전 기록·보관본 이름을 보려고 통합 묶음으로 표시한다.
+RELEASE_BUNDLE=total make_release "$TEST_ROOT/acs-v2-task.zip" v2 task - "listen 13199;\n"
+RELEASE_BUNDLE=total make_release "$TEST_ROOT/acs-v3-state.zip" v3 state -
 
 echo "▶ deploy.sh --no-systemd: 설정 파일·site.env 생성 후 설치"
 bash "$KIT_DIR/deploy.sh" --input="$TEST_ROOT/acs-v1.zip" --root="$ACS_ROOT" --project=rb-acs-test --gateway-url=http://127.0.0.1:65530 \
@@ -265,6 +270,7 @@ snapshot_staging="$TEST_ROOT/snapshot-check"
 python3 -I "$KIT_DIR/release.py" extract "$snapshot_path" "$snapshot_staging"
 assert_true "보관본은 그대로 적용할 수 있는 릴리즈 ZIP" python3 -I "$KIT_DIR/release.py" validate "$snapshot_staging" amd64
 assert_equal "보관본 버전은 이전 설치 버전" "v1" "$(json_value "$snapshot_staging/version.json" version)"
+assert_equal "통합 묶음 적용 전 보관본은 통합 묶음(되돌리면 통합 버전도 되돌림)" "total" "$(json_value "$snapshot_staging/version.json" bundle)"
 assert_equal "보관본에 담은 서비스(바뀐 서비스만)" "task" "$(python3 -I "$KIT_DIR/release.py" get "$snapshot_staging" services)"
 assert_equal "보관본 task 서비스 버전" "v1" "$(json_value "$snapshot_staging/version.json" services.task.version)"
 assert_equal "어느 버전 적용 전인지" "v2" "$(json_value "$snapshot_staging/version.json" snapshot.replaced_by)"
@@ -386,7 +392,7 @@ assert_true "update.log에도 이유" grep -q "acs-v5-silent.zip: 업데이트 �
 assert_true "stderr 임시 파일 정리" test ! -e "$ACS_ROOT/deploy/.update-stderr.log"
 
 echo "▶ 온라인 자동배포: 기본은 최신 버전 조회만 하고, 명시적으로 켜면 새 버전만 검증 후 적용"
-make_release "$TEST_ROOT/acs-v6-task-update.zip" 6.0.0 task -
+RELEASE_BUNDLE=total make_release "$TEST_ROOT/acs-v6-task-update.zip" 6.0.0 task -
 export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v6-task-update.zip"
 export FAKE_ONLINE_MANIFEST="$TEST_ROOT/latest.json"
 online_sha="$(sha256sum "$FAKE_ONLINE_PACKAGE" | cut -d' ' -f1)"
@@ -409,7 +415,7 @@ assert_equal "같은 버전이면 수동 온라인 업데이트는 받지 않고
 assert_true "같은 버전이면 ZIP을 받지 않음" bash -c "! grep -q 'acs-v6-task-update.zip' '$FAKE_LOG'"
 assert_true "받은 파일을 남기지 않음" bash -c "! ls -A '$ACS_ROOT/deploy' | grep -q 'manual-online'"
 
-make_release "$TEST_ROOT/acs-v7-task-update.zip" 7.0.0 task -
+RELEASE_BUNDLE=total make_release "$TEST_ROOT/acs-v7-task-update.zip" 7.0.0 task -
 export FAKE_ONLINE_PACKAGE="$TEST_ROOT/acs-v7-task-update.zip"
 online_sha="$(sha256sum "$FAKE_ONLINE_PACKAGE" | cut -d' ' -f1)"
 cat > "$FAKE_ONLINE_MANIFEST" <<EOF
@@ -429,7 +435,7 @@ assert_equal "온라인 자동 출처" "online-auto" "$(json_value "$(latest_run
 echo "▶ 버전 탭 온라인: 서비스별 최신 버전 표시, UI 요청으로 서비스·전체 업데이트, 자동 업데이트 켜고 끄기"
 export FAKE_ONLINE_SERVICES_DIR="$TEST_ROOT/online-services"
 mkdir -p "$FAKE_ONLINE_SERVICES_DIR/task" "$FAKE_ONLINE_SERVICES_DIR/state"
-RELEASE_BRANCH=develop RELEASE_SERVICE_VERSION=7.1.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.1.0.zip" 7.0.0 task -
+RELEASE_BUNDLE=service RELEASE_BRANCH=develop RELEASE_SERVICE_VERSION=7.1.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.1.0.zip" 7.0.0 task -
 echo '{"new_version": "7.1.0", "git_commit": "abc1234"}' > "$FAKE_ONLINE_SERVICES_DIR/task/version.json"
 echo '{"new_version": "3.0.0", "git_commit": "abc1234"}' > "$FAKE_ONLINE_SERVICES_DIR/state/version.json"
 # 버전 탭에서 자동 업데이트를 끄면 현장 설정(ACS_ONLINE_AUTO_UPDATE=1)보다 우선한다.
@@ -471,7 +477,7 @@ assert_true "오래된 업데이트 요청은 버림" test ! -e "$ACS_ROOT/deplo
 assert_true "오래된 업데이트 요청은 적용하지 않음" grep -q "task 7.1.0" "$ACS_ROOT/services/task/task.amd64.bin"
 
 # sha256이 있는 서비스 version.json이면 받은 ZIP을 검증한다.
-RELEASE_SERVICE_VERSION=7.2.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.2.0.zip" 7.0.0 task -
+RELEASE_BUNDLE=service RELEASE_SERVICE_VERSION=7.2.0 make_release "$FAKE_ONLINE_SERVICES_DIR/task/7.2.0.zip" 7.0.0 task -
 echo '{"new_version": "7.2.0", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}' > "$FAKE_ONLINE_SERVICES_DIR/task/version.json"
 echo '{"kind": "check"}' > "$ACS_ROOT/deploy/requests/1002-check.json"
 echo '{"kind": "update", "target": "task", "force": true}' > "$ACS_ROOT/deploy/requests/1003-update.json"
@@ -570,6 +576,36 @@ assert_true "docker 그룹 추가" grep -q "sudo usermod -aG docker" "$FAKE_LOG"
 assert_true "sg docker로 다시 실행" grep -q "sg docker" "$FAKE_LOG"
 assert_true "다시 실행한 쪽이 설치 완료" test -f "$TEST_ROOT/rb-acs-group/deploy/installed.json"
 rm -f "$FAKE_STATE_DIR/docker-needs-group"
+
+echo "▶ 서비스 ZIP은 매니페스트 version(빌드 때 최신 통합 버전)이 새로워도 설치 통합 버전을 바꾸지 않음"
+record_root="$TEST_ROOT/record-scope"
+mkdir -p "$record_root/service" "$record_root/total"
+cat > "$record_root/installed.json" <<'EOF'
+{"version": "v1.0.0", "services": {"task": {"version": "v1.0.0", "sha256": "a"}, "state": {"version": "v1.0.0", "sha256": "b"}}}
+EOF
+cat > "$record_root/service/version.json" <<'EOF'
+{"kind": "acs.release", "format_version": 1, "version": "v1.0.3", "services": {"task": {"version": "v1.0.4", "sha256": "c"}}}
+EOF
+cat > "$record_root/total/version.json" <<'EOF'
+{"kind": "acs.release", "format_version": 1, "version": "v1.0.3", "services": {"task": {"version": "v1.0.4", "sha256": "c"}, "state": {"version": "v1.0.2", "sha256": "d"}}}
+EOF
+cat > "$record_root/online.json" <<'EOF'
+{"reachable": true, "total": {"version": "v1.0.3", "path": "update/1.0.3.amd64.zip"}, "services": {}}
+EOF
+python3 -I "$KIT_DIR/release.py" record "$record_root/installed.json" "$record_root/service" "" success ""
+assert_equal "서비스 ZIP 뒤 설치 통합 버전 그대로" "v1.0.0" "$(json_value "$record_root/installed.json" version)"
+assert_equal "서비스 ZIP의 서비스 버전은 기록" "v1.0.4" "$(json_value "$record_root/installed.json" services.task.version)"
+assert_equal "서비스 ZIP 뒤에도 최신 통합 버전을 자동 업데이트 대상으로" "total" "$(python3 -I "$KIT_DIR/release.py" online-next "$record_root/online.json" "$record_root/installed.json")"
+python3 -I "$KIT_DIR/release.py" record "$record_root/installed.json" "$record_root/total" "" success ""
+assert_equal "설치 서비스를 모두 담은 ZIP은 통합 버전 기록" "v1.0.3" "$(json_value "$record_root/installed.json" version)"
+assert_equal "통합 적용 뒤에는 통합 업데이트 대상 아님" "" "$(python3 -I "$KIT_DIR/release.py" online-next "$record_root/online.json" "$record_root/installed.json")"
+# 새 빌드는 bundle로 종류를 밝히므로, 서비스를 모두 담았어도 service면 통합 버전을 바꾸지 않는다.
+mkdir -p "$record_root/marked-service"
+cat > "$record_root/marked-service/version.json" <<'EOF'
+{"kind": "acs.release", "format_version": 1, "version": "v1.0.9", "bundle": "service", "services": {"task": {"version": "v1.0.5", "sha256": "e"}, "state": {"version": "v1.0.3", "sha256": "f"}}}
+EOF
+python3 -I "$KIT_DIR/release.py" record "$record_root/installed.json" "$record_root/marked-service" "" success ""
+assert_equal "bundle=service는 서비스를 모두 담아도 통합 버전 그대로" "v1.0.3" "$(json_value "$record_root/installed.json" version)"
 
 echo "▶ 태그 없이 만든 간이 배포 버전(-dev.<시각>)은 같은 번호의 정식 버전보다 낮다"
 assert_equal "간이 배포 뒤 정식 버전은 새 버전" "true" "$(python3 -I "$KIT_DIR/release.py" version-is-newer 1.0.5 v1.0.5-dev.202611041530)"

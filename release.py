@@ -483,10 +483,32 @@ def write_heartbeat(heartbeat_name: str, interval_seconds: str) -> None:
     })
 
 
+def is_total_bundle(manifest: dict, installed_services: dict) -> bool:
+    """이 릴리즈를 적용하면 설치 통합 버전이 매니페스트 version이 되는지 판단합니다.
+
+    서비스·간이 ZIP도 매니페스트 version에 빌드 때 최신 통합 버전이 들어 있습니다. 그 값을 설치 통합 버전으로 적으면 나머지
+    서비스가 옛 버전인데도 통합 버전이 최신으로 보여 통합 업데이트가 막힙니다. 그래서 `bundle`이 `total`일 때만 통합 버전으로 봅니다.
+    `bundle`이 없는 예전 ZIP은 설치된 서비스를 모두 담았을 때만 통합으로 봅니다(최초 설치는 설치 서비스가 없어 통합).
+
+    Args:
+        manifest (dict): 적용할 릴리즈 매니페스트입니다.
+        installed_services (dict): 적용 전 installed.json의 서비스별 정보입니다.
+
+    Returns:
+        bool: 통합 묶음이면 True입니다.
+    """
+    bundle = manifest.get("bundle")
+    if bundle:
+        return bundle == "total"
+    return set(installed_services) <= set(manifest.get("services") or {})
+
+
 def record(
     installed_name: str, staging_name: str, images_tag: str, result: str, message: str, run_id: str = "", source: str = "",
 ) -> None:
-    """적용 결과를 installed.json에 남깁니다. 성공이면 전체·서비스별 버전과 이미지 태그를 바꾸고, 실패면 이력만 더합니다.
+    """적용 결과를 installed.json에 남깁니다. 성공이면 서비스별 버전과 이미지 태그를 바꾸고, 실패면 이력만 더합니다.
+
+    설치 통합 버전(`version`·`git_commit`)은 통합 묶음을 적용했을 때만 바꿉니다(`is_total_bundle`).
 
     Args:
         installed_name (str): installed.json 경로입니다.
@@ -503,15 +525,17 @@ def record(
     applied_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if result == "success":
         installed_services = installed.get("services") or {}
+        total_bundle = is_total_bundle(manifest, installed_services)
         for service_name, service_entry in (manifest.get("services") or {}).items():
             # 브랜치(온라인 채널)는 서비스마다 다를 수 있습니다(예: develop 서비스 ZIP을 main 현장에 적용). 예전 ZIP은 없습니다.
             installed_services[service_name] = {
                 "version": service_entry["version"], "sha256": service_entry["sha256"], "installed_at": applied_at,
                 "branch": service_entry.get("branch") or manifest.get("branch"),
             }
+        if total_bundle:
+            installed.update({"version": manifest["version"], "git_commit": manifest.get("git_commit")})
         installed.update({
-            "version": manifest["version"], "git_commit": manifest.get("git_commit"), "installed_at": applied_at,
-            "branch": manifest.get("branch") or installed.get("branch"),
+            "installed_at": applied_at, "branch": manifest.get("branch") or installed.get("branch"),
             "images_tag": images_tag, "services": installed_services,
         })
     history = installed.get("history") or []
@@ -617,6 +641,8 @@ def snapshot(staging_name: str, acs_root_name: str, installed_name: str, archive
         "kind": RELEASE_KIND,
         "format_version": SUPPORTED_FORMAT_VERSION,
         "version": previous_version,
+        # 통합 묶음 적용 전 보관본을 되돌리면 설치 통합 버전도 이전 값으로, 서비스 ZIP 적용 전 보관본이면 그대로 둡니다.
+        "bundle": "total" if is_total_bundle(new_manifest, installed_services) else "service",
         "branch": installed.get("branch"),
         "created_at": taken_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git_commit": installed.get("git_commit"),
