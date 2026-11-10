@@ -289,7 +289,13 @@ if [ "$INSTALL_MODE" -eq 0 ] && [ -n "$(acs_compose ps -q mongo 2>/dev/null)" ];
   write_status running backup "DB를 백업하는 중"
   backup_dir="$ACS_ROOT/backups/$(date '+%Y%m%d-%H%M%S')-$CURRENT_VERSION"
   mkdir -p "$backup_dir"
-  acs_compose exec -T mongo mongodump --archive --gzip --quiet > "$backup_dir/mongo.archive.gz" \
+  acs_compose exec -T mongo sh -c '
+    exec mongodump \
+      --username "$MONGO_INITDB_ROOT_USERNAME" \
+      --password "$MONGO_INITDB_ROOT_PASSWORD" \
+      --authenticationDatabase admin \
+      --archive --gzip --quiet
+  ' > "$backup_dir/mongo.archive.gz" \
     || fail_without_changes "MongoDB 백업에 실패했습니다. 아무것도 바꾸지 않았습니다."
   if [ -n "$(acs_compose ps -q postgres 2>/dev/null)" ]; then
     acs_compose exec -T postgres pg_dump -U state -d state | gzip > "$backup_dir/postgres.sql.gz" \

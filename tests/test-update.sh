@@ -31,7 +31,17 @@ if [ "${1:-}" = "compose" ]; then
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
     *" ps -a --services "*|*" ps --services --status running "*) [ -f "$FAKE_STATE_DIR/containers-created" ] && printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres; exit 0 ;;
     *" up "*) touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
-    *" mongodump "*) echo "mongo-backup"; exit 0 ;;
+    *" mongodump "*)
+      [ -f "$FAKE_STATE_DIR/mongo-backup-fails" ] && exit 1
+      if [ -f "$FAKE_STATE_DIR/mongo-auth-required" ]; then
+        case " $* " in
+          *" mongo sh -c "*)
+            MONGO_INITDB_ROOT_USERNAME=backup_test_admin MONGO_INITDB_ROOT_PASSWORD='Backup@Test!#' bash -c "${!#}"
+            exit $? ;;
+          *) exit 1 ;;
+        esac
+      fi
+      echo "mongo-backup"; exit 0 ;;
     *" pg_dump "*) echo "pg-backup"; exit 0 ;;
     *) exit 0 ;;
   esac
@@ -94,6 +104,24 @@ fi
 exit 7
 EOF
 chmod +x "$FAKE_BIN_DIR/docker" "$FAKE_BIN_DIR/curl"
+# 컨테이너 환경의 인증값이 특수문자까지 그대로 전달되는지 검사하는 백업 명령입니다.
+cat > "$FAKE_BIN_DIR/mongodump" <<'EOF'
+#!/bin/bash
+mongo_user=""
+mongo_password=""
+authentication_database=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --username) mongo_user="$2"; shift 2 ;;
+    --password) mongo_password="$2"; shift 2 ;;
+    --authenticationDatabase) authentication_database="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ "$mongo_user" = backup_test_admin ] && [ "$mongo_password" = 'Backup@Test!#' ] && [ "$authentication_database" = admin ] || exit 1
+echo "mongo-backup"
+EOF
+chmod +x "$FAKE_BIN_DIR/mongodump"
 export PATH="$FAKE_BIN_DIR:$PATH"
 
 # ── 설치 설정 ──
@@ -283,6 +311,24 @@ assert_equal "같은 설정으로 v2(task) 다시 적용" "0" "$(run_update "$TE
 assert_true "compose up 생략" bash -c "! grep -q ' up ' '$FAKE_LOG'"
 assert_true "task만 재시작" grep -q "restart task$" "$FAKE_LOG"
 assert_true "로그에 생략 이유" grep -q "compose up을 건너뜁니다" "$ACS_ROOT/deploy/update.log"
+
+echo "MongoDB 백업 인증: 기존 컨테이너 환경값 사용과 실패 시 교체 중단"
+touch "$FAKE_STATE_DIR/mongo-auth-required"
+: > "$FAKE_LOG"
+assert_equal "인증이 필요한 MongoDB 백업도 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "관리자 이름은 컨테이너 환경에서 읽음" grep -Fq -- '--username "$MONGO_INITDB_ROOT_USERNAME"' "$FAKE_LOG"
+assert_true "관리자 비밀번호는 컨테이너 환경에서 읽음" grep -Fq -- '--password "$MONGO_INITDB_ROOT_PASSWORD"' "$FAKE_LOG"
+assert_true "MongoDB 관리자 인증 DB 지정" grep -Fq -- '--authenticationDatabase admin' "$FAKE_LOG"
+assert_true "특수문자가 포함된 비밀번호는 로그에 출력하지 않음" bash -c '! grep -Fq -- "Backup@Test!#" "$1" "$2"' _ "$FAKE_LOG" "$ACS_ROOT/deploy/update.log"
+cp "$ACS_ROOT/site.env" "$TEST_ROOT/site-before-mongo-failure.env"
+touch "$FAKE_STATE_DIR/mongo-backup-fails"
+: > "$FAKE_LOG"
+assert_equal "MongoDB 백업 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v3-state.zip")"
+assert_equal "MongoDB 백업 실패 단계" "backup" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+assert_true "백업 실패 시 서비스 bin 보존" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
+assert_true "백업 실패 시 현장 환경설정 보존" cmp -s "$TEST_ROOT/site-before-mongo-failure.env" "$ACS_ROOT/site.env"
+assert_true "백업 실패 시 서비스 재기동 없음" bash -c '! grep -Eq " (restart|up) " "$1"' _ "$FAKE_LOG"
+rm -f "$FAKE_STATE_DIR/mongo-auth-required" "$FAKE_STATE_DIR/mongo-backup-fails"
 
 echo "▶ sha256이 맞지 않으면 아무것도 바꾸지 않음"
 python3 -I - "$TEST_ROOT/acs-v3-state.zip" "$TEST_ROOT/acs-v3-broken.zip" <<'PYEOF'
