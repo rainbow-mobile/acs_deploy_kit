@@ -26,12 +26,34 @@ if [ "${1:-}" = "compose" ]; then
   case " $* " in
     *" version --short "*) echo "2.39.1"; exit 0 ;;
     *" version "*) echo "Docker Compose version v2.39.1"; exit 0 ;;
-    *" config --images "*) for image_name in $FAKE_IMAGES; do echo "$image_name"; done; exit 0 ;;
+    *" config --images "*)
+      if [[ "$*" == *infrastructure/observability/compose.yml* ]]; then
+        printf '%s\n' grafana/loki:3.5.3 grafana/alloy:v1.10.2
+      else
+        for image_name in $FAKE_IMAGES; do echo "$image_name"; done
+      fi
+      exit 0 ;;
     *" ps -q "*) echo "cid-${!#}"; exit 0 ;;
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
     *" ps -a --services "*|*" ps --services --status running "*) [ -f "$FAKE_STATE_DIR/containers-created" ] && printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres; exit 0 ;;
-    *" up "*) touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
-    *" mongodump "*) echo "mongo-backup"; exit 0 ;;
+    *" up "*)
+      [[ "$*" == *infrastructure/observability/compose.yml* ]] && [ -f "$FAKE_STATE_DIR/observability-up-fails" ] && exit 1
+      touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
+    *" exec -T api-gateway nginx -t "*) [ -f "$FAKE_STATE_DIR/gateway-config-fails" ] && exit 1; exit 0 ;;
+    *" exec -T api-gateway nginx -s reload "*)
+      [ -f "$FAKE_STATE_DIR/gateway-reload-fails" ] && exit 1
+      exit 0 ;;
+    *" mongodump "*)
+      [ -f "$FAKE_STATE_DIR/mongo-backup-fails" ] && exit 1
+      if [ -f "$FAKE_STATE_DIR/mongo-auth-required" ]; then
+        case " $* " in
+          *" mongo sh -c "*)
+            MONGO_INITDB_ROOT_USERNAME=backup_test_admin MONGO_INITDB_ROOT_PASSWORD='-Backup@Test!#' bash -c "${!#}"
+            exit $? ;;
+          *) exit 1 ;;
+        esac
+      fi
+      echo "mongo-backup"; exit 0 ;;
     *" pg_dump "*) echo "pg-backup"; exit 0 ;;
     *) exit 0 ;;
   esac
@@ -94,6 +116,25 @@ fi
 exit 7
 EOF
 chmod +x "$FAKE_BIN_DIR/docker" "$FAKE_BIN_DIR/curl"
+# 컨테이너 환경의 인증값이 특수문자까지 그대로 전달되는지 검사하는 백업 명령입니다.
+cat > "$FAKE_BIN_DIR/mongodump" <<'EOF'
+#!/bin/bash
+mongo_user=""
+mongo_password=""
+authentication_database=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --username) mongo_user="$2"; shift 2 ;;
+    --password) [[ "${2:-}" == -* ]] && exit 1; mongo_password="$2"; shift 2 ;;
+    --password=*) mongo_password="${1#*=}"; shift ;;
+    --authenticationDatabase) authentication_database="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ "$mongo_user" = backup_test_admin ] && [ "$mongo_password" = '-Backup@Test!#' ] && [ "$authentication_database" = admin ] || exit 1
+echo "mongo-backup"
+EOF
+chmod +x "$FAKE_BIN_DIR/mongodump"
 export PATH="$FAKE_BIN_DIR:$PATH"
 
 # ── 설치 설정 ──
@@ -131,8 +172,20 @@ for service_name in services_csv.split(","):
     services[service_name] = {"version": service_version, "path": path, "sha256": hashlib.sha256(content).hexdigest()}
 runtime_files = {
     "compose.yml": b"services: {}\n", "compose.offline.yml": f"# {version}\n".encode(), ".env": b"TASK_PORT=18002\n",
-    "site.env.example": b"# example\nPOSTGRES_PASSWORD=change-me\nFRS_API_BASE_URL=http://192.168.60.200:3000\nSMC_MOMS_URL=http://mock:18006\n",
+    "site.env.example": (
+        b"# example\nPOSTGRES_PASSWORD=change-me\nMONGO_INITDB_ROOT_USERNAME=acs_admin\n"
+        b"MONGO_INITDB_ROOT_PASSWORD=\nACS_RUNTIME_PASSWORD_ENCODED=\nACS_SCHEMA_PASSWORD_ENCODED=\n"
+        b"ACS_MONGO_RUNTIME_PASSWORD_ENCODED=\nACS_MONGO_SCHEMA_PASSWORD_ENCODED=\n"
+        b"SMC_DATABASE_URL=postgresql://runtime:${ACS_RUNTIME_PASSWORD_ENCODED}@postgres:5432/state\n"
+        b"SMC_SCHEMA_DATABASE_URL=postgresql://schema:${ACS_SCHEMA_PASSWORD_ENCODED}@postgres:5432/state\n"
+        b"SM_MONGO_URI=mongodb://runtime:${ACS_MONGO_RUNTIME_PASSWORD_ENCODED}@mongo:27017/?authSource=admin\n"
+        b"TASK_MONGO_SCHEMA_URI=mongodb://schema:${ACS_MONGO_SCHEMA_PASSWORD_ENCODED}@mongo:27017/?authSource=admin\n"
+        b"FRS_API_BASE_URL=http://192.168.60.200:3000\nSMC_MOMS_URL=http://mock:18006\n"
+    ),
     "api-gateway/servers/smc.conf": smc_conf.encode(), "zenoh-router-acs/zenoh.json5": b"{}\n",
+    "infrastructure/observability/compose.yml": b"name: rb-acs-observability\nservices: {}\n",
+    "infrastructure/observability/loki/loki.yaml": f"# {version}\nlimits_config:\n  retention_period: 720h\n".encode(),
+    "infrastructure/observability/alloy/config.alloy": b"// existing Alloy\n",
 }
 for relative_path, content in runtime_files.items():
     entries[f"runtime/{relative_path}"] = content
@@ -202,9 +255,43 @@ assert_true "이미지 load" grep -q "docker load -i" "$FAKE_LOG"
 assert_true "최초 설치는 DB 백업을 하지 않음" bash -c "! grep -q mongodump '$FAKE_LOG'"
 assert_true "최초 설치는 compose up이 만든 컨테이너를 다시 재시작하지 않음" bash -c "! grep -q ' restart ' '$FAKE_LOG'"
 assert_true "최초 설치는 이전 버전 보관본이 없음" bash -c "! ls '$ACS_ROOT'/deploy/archives/*.zip >/dev/null 2>&1"
+assert_true "최초 설치는 기존 Loki·Alloy 자동 기동" grep -E -q 'infrastructure/observability/compose.yml up -d .*loki alloy' "$FAKE_LOG"
+assert_true "수집기 상태 조회를 추가하지 않음" bash -c "! grep -E 'inspect .*cid-(loki|alloy)|infrastructure/observability/compose.yml ps|curl .*:(3100|12345)' '$FAKE_LOG'"
 assert_equal "온라인 자동배포 기본값은 꺼짐" "0" "$(bash -c '. "$1"; echo "$ACS_ONLINE_AUTO_UPDATE"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 채널" "main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_CHANNEL"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 주소" "https://diokjo4dtg1mp.cloudfront.net/acs/main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_BASE_URL"' _ "$ACS_ENV_FILE")"
+
+echo "최초 설정: 관리자·운영·DDL 비밀번호 생성과 기존 설정 보존"
+python3 -I - "$ACS_ROOT/site.env" > "$TEST_ROOT/generated-password-check.json" <<'PYEOF'
+import json, re, sys
+from pathlib import Path
+settings = dict(line.split("=", 1) for line in Path(sys.argv[1]).read_text().splitlines() if line and not line.startswith("#") and "=" in line)
+passwords = [settings.get(name, "") for name in ("POSTGRES_PASSWORD", "MONGO_INITDB_ROOT_PASSWORD", "ACS_RUNTIME_PASSWORD_ENCODED", "ACS_SCHEMA_PASSWORD_ENCODED", "ACS_MONGO_RUNTIME_PASSWORD_ENCODED", "ACS_MONGO_SCHEMA_PASSWORD_ENCODED")]
+print(json.dumps({
+    "complete": all(passwords),
+    "distinct": len(set(passwords)) == 6,
+    "url_safe": all(len(password) >= 24 and re.fullmatch(r"[A-Za-z0-9_-]+", password) for password in passwords),
+    "references_preserved": "${ACS_RUNTIME_PASSWORD_ENCODED}" in settings["SMC_DATABASE_URL"] and "${ACS_SCHEMA_PASSWORD_ENCODED}" in settings["SMC_SCHEMA_DATABASE_URL"] and "${ACS_MONGO_RUNTIME_PASSWORD_ENCODED}" in settings["SM_MONGO_URI"] and "${ACS_MONGO_SCHEMA_PASSWORD_ENCODED}" in settings["TASK_MONGO_SCHEMA_URI"],
+    "passwords_not_logged": not any(password and password in (Path(sys.argv[1]).parent / "deploy/update.log").read_text() for password in passwords),
+}))
+PYEOF
+assert_equal "필수 비밀번호 여섯 항목 모두 생성" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" complete)"
+assert_equal "각 계정의 비밀번호를 별도로 생성" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" distinct)"
+assert_equal "생성된 비밀번호는 URI에 사용할 수 있음" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" url_safe)"
+assert_equal "기존 URI 변수 참조 유지" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" references_preserved)"
+assert_equal "생성된 비밀번호는 배포 로그에 출력하지 않음" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" passwords_not_logged)"
+python3 -I - "$ACS_ROOT/site.env" "$TEST_ROOT/provided-site.env" <<'PYEOF'
+from pathlib import Path
+import sys
+contents = "\n".join(line for line in Path(sys.argv[1]).read_text().splitlines() if not line.startswith(("ACS_MONGO_RUNTIME_PASSWORD_ENCODED=", "ACS_MONGO_SCHEMA_PASSWORD_ENCODED="))) + "\n"
+contents = contents.replace("${ACS_MONGO_RUNTIME_PASSWORD_ENCODED}", "${ACS_RUNTIME_PASSWORD_ENCODED}").replace("${ACS_MONGO_SCHEMA_PASSWORD_ENCODED}", "${ACS_SCHEMA_PASSWORD_ENCODED}")
+Path(sys.argv[2]).write_text(contents)
+PYEOF
+printf '\n# 현장 설정 보존 검사\n' >> "$TEST_ROOT/provided-site.env"
+ACS_ENV_FILE="$TEST_ROOT/etc/provided-env.conf" bash "$KIT_DIR/deploy.sh" --input="$TEST_ROOT/acs-v1.zip" \
+  --root="$TEST_ROOT/rb-acs-provided" --site-env="$TEST_ROOT/provided-site.env" --no-systemd >/dev/null 2>&1
+assert_equal "사용자 설정을 지정한 설치 성공" "0" "$?"
+assert_true "기존 공통 비밀번호 설정도 그대로 복사" cmp -s "$TEST_ROOT/provided-site.env" "$TEST_ROOT/rb-acs-provided/site.env"
 
 echo "▶ acs 명령: 설치한 서비스 상태·실행·중지·재시작·로그 (업데이트 중이면 거절)"
 : > "$FAKE_LOG"
@@ -242,6 +329,8 @@ assert_true "링크로 불러도 같은 compose" grep -q "restart task" "$FAKE_L
 
 echo "▶ 현장 파일은 업데이트가 덮어쓰지 않음 + Task만 바꾸는 부분 업데이트"
 echo "listen 13105; # 현장 수정" > "$ACS_ROOT/api-gateway/servers/smc.conf"
+echo '# 현장 관측 포트·볼륨 유지' >> "$ACS_ROOT/infrastructure/observability/compose.yml"
+cp "$ACS_ROOT/infrastructure/observability/compose.yml" "$TEST_ROOT/observability-before-update.yml"
 : > "$FAKE_LOG"
 assert_equal "v2(task) 적용 종료 코드" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
 assert_true "task bin은 v2" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
@@ -250,6 +339,8 @@ assert_equal "서비스별 버전(task)" "v2" "$(json_value "$ACS_ROOT/deploy/in
 assert_equal "서비스별 버전(state)" "v1" "$(json_value "$ACS_ROOT/deploy/installed.json" services.state.version)"
 assert_equal "이미지 없는 ZIP은 설치된 이미지 태그 유지" "v1" "$(json_value "$ACS_ROOT/deploy/installed.json" images_tag)"
 assert_true "현장 서버 블록 보존" grep -q "현장 수정" "$ACS_ROOT/api-gateway/servers/smc.conf"
+assert_true "현장 관측 Compose 보존" cmp -s "$TEST_ROOT/observability-before-update.yml" "$ACS_ROOT/infrastructure/observability/compose.yml"
+assert_true "변경된 DB 보관 설정 재적용" grep -E -q 'infrastructure/observability/compose.yml up -d .*--force-recreate.*loki alloy' "$FAKE_LOG"
 assert_true "업데이트 전 DB 백업" bash -c "ls '$ACS_ROOT'/backups/*-v2/mongo.archive.gz >/dev/null"
 assert_true "task 재시작" grep -q "restart task" "$FAKE_LOG"
 assert_true "바뀐 설정이 없으면 Gateway 재시작 안 함" bash -c "! grep -q 'restart task api-gateway' '$FAKE_LOG'"
@@ -286,9 +377,143 @@ assert_equal "다시 v2 적용" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
 echo "▶ 설정 파일이 그대로면 compose up 없이 바뀐 서비스만 재시작"
 : > "$FAKE_LOG"
 assert_equal "같은 설정으로 v2(task) 다시 적용" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
-assert_true "compose up 생략" bash -c "! grep -q ' up ' '$FAKE_LOG'"
+assert_true "ACS compose up 생략" bash -c "! grep ' up ' '$FAKE_LOG' | grep -v 'infrastructure/observability/compose.yml'"
 assert_true "task만 재시작" grep -q "restart task$" "$FAKE_LOG"
 assert_true "로그에 생략 이유" grep -q "compose up을 건너뜁니다" "$ACS_ROOT/deploy/update.log"
+
+echo "MongoDB 백업 인증: 기존 컨테이너 환경값 사용과 실패 시 교체 중단"
+touch "$FAKE_STATE_DIR/mongo-auth-required"
+: > "$FAKE_LOG"
+assert_equal "인증이 필요한 MongoDB 백업도 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "관리자 이름은 컨테이너 환경에서 읽음" grep -Fq -- '--username "$MONGO_INITDB_ROOT_USERNAME"' "$FAKE_LOG"
+assert_true "관리자 비밀번호는 선두 -도 포함한 값으로 전달" grep -Fq -- '--password="$MONGO_INITDB_ROOT_PASSWORD"' "$FAKE_LOG"
+assert_true "MongoDB 관리자 인증 DB 지정" grep -Fq -- '--authenticationDatabase admin' "$FAKE_LOG"
+assert_true "특수문자가 포함된 비밀번호는 로그에 출력하지 않음" bash -c '! grep -Fq -- "Backup@Test!#" "$1" "$2"' _ "$FAKE_LOG" "$ACS_ROOT/deploy/update.log"
+cp "$ACS_ROOT/site.env" "$TEST_ROOT/site-before-mongo-failure.env"
+touch "$FAKE_STATE_DIR/mongo-backup-fails"
+: > "$FAKE_LOG"
+assert_equal "MongoDB 백업 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v3-state.zip")"
+assert_equal "MongoDB 백업 실패 단계" "backup" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+assert_true "백업 실패 시 서비스 bin 보존" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
+assert_true "백업 실패 시 현장 환경설정 보존" cmp -s "$TEST_ROOT/site-before-mongo-failure.env" "$ACS_ROOT/site.env"
+assert_true "백업 실패 시 서비스 재기동 없음" bash -c '! grep -Eq " (restart|up) " "$1"' _ "$FAKE_LOG"
+rm -f "$FAKE_STATE_DIR/mongo-auth-required" "$FAKE_STATE_DIR/mongo-backup-fails"
+
+echo "Gateway 갱신: 서비스 준비 후 설정 검사와 주소 갱신"
+: > "$FAKE_LOG"
+assert_equal "Gateway 갱신을 포함한 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "Gateway 설정 검사" grep -q 'exec -T api-gateway nginx -t' "$FAKE_LOG"
+assert_true "Gateway 설정 reload" grep -q 'exec -T api-gateway nginx -s reload' "$FAKE_LOG"
+assert_true "서비스 상태 확인 후 검사·reload로 종료" python3 -I -c 'import sys
+commands=open(sys.argv[1]).read().splitlines()
+health=max(position for position,command in enumerate(commands) if "docker inspect " in command)
+check=next(position for position,command in enumerate(commands) if "exec -T api-gateway nginx -t" in command)
+reload=next(position for position,command in enumerate(commands) if "exec -T api-gateway nginx -s reload" in command)
+assert health < check < reload
+assert not any("curl " in command and "/task/execution/executions" in command for command in commands[reload+1:])' "$FAKE_LOG"
+
+echo "curl 없는 환경: Python 표준 라이브러리로 업데이트 전 Task 확인"
+python3 -I - "$KIT_DIR" "$TEST_ROOT" <<'PYEOF'
+import json, os, subprocess, sys, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+kit_directory, test_directory = map(Path, sys.argv[1:])
+request_paths = []
+
+class TaskHandler(BaseHTTPRequestHandler):
+    """실제 서비스 대신 로컬 시험용 Task API를 제공합니다."""
+
+    def do_GET(self) -> None:
+        """정상·실행 중·잘못된 응답·HTTP 오류를 반환합니다."""
+        request_paths.append(self.path)
+        payloads = {
+            "/idle/task/execution/executions": b"[]",
+            "/busy/task/execution/executions": b'[{"state":"running"},{"state":"completed"}]',
+            "/invalid/task/execution/executions": b"not-json",
+        }
+        self.send_response(200 if self.path in payloads else 503)
+        self.end_headers()
+        self.wfile.write(payloads.get(self.path, b"unavailable"))
+
+    def log_message(self, message: str, *arguments: object) -> None:
+        """시험 서버의 접속 로그를 생략합니다.
+
+        Args:
+            message (str): 기본 접속 로그 형식입니다.
+            *arguments (object): 로그 형식에 넣을 값입니다.
+        """
+
+shell_environment = test_directory / "no-curl.sh"
+shell_environment.write_text('''command() {
+  if [ "$#" -eq 2 ] && [ "$1" = -v ] && [ "$2" = curl ]; then return 1; fi
+  builtin command "$@"
+}
+curl() { return 127; }
+''')
+temporary_directory = test_directory / "no-curl-temporary"
+temporary_directory.mkdir()
+environment = dict(os.environ, BASH_ENV=str(shell_environment), TMPDIR=str(temporary_directory))
+server = ThreadingHTTPServer(("127.0.0.1", 0), TaskHandler)
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+base_url = f"http://127.0.0.1:{server.server_port}"
+results = {}
+try:
+    for response_name in ("idle", "busy", "invalid", "error"):
+        completed = subprocess.run(
+            ["bash", "-c", '. "$1/common.sh"; load_acs_env; ACS_GATEWAY_URL="$2"; active_task_count',
+             "_", str(kit_directory), f"{base_url}/{response_name}"],
+            env=environment, capture_output=True, text=True, timeout=15,
+        )
+        results[response_name] = completed.stdout.strip()
+    source_configuration = Path(os.environ["ACS_ENV_FILE"]).read_text()
+    configuration_path = test_directory / "no-curl.env"
+    for response_name, arguments in (
+        ("busy", []), ("update", []), ("install", ["--install"]),
+    ):
+        gateway_url = f"{base_url}/{'busy' if response_name == 'busy' else 'idle'}"
+        configuration_path.write_text(source_configuration + f'\nACS_GATEWAY_URL="{gateway_url}"\n')
+        previous_requests = len(request_paths)
+        completed = subprocess.run(
+            ["bash", str(kit_directory / "update.sh"), *arguments, str(test_directory / "acs-v2-task.zip")],
+            env=dict(environment, ACS_ENV_FILE=str(configuration_path)),
+            capture_output=True, text=True, timeout=45,
+        )
+        results[response_name + "Exit"] = str(completed.returncode)
+        results[response_name + "Requests"] = str(len(request_paths) - previous_requests)
+        (test_directory / ("no-curl-" + response_name + ".log")).write_text(completed.stdout + completed.stderr)
+    results["temporaryFiles"] = str(len(list(temporary_directory.iterdir())))
+    results["httpRequests"] = request_paths
+finally:
+    server.shutdown()
+    server.server_close()
+    server_thread.join()
+(test_directory / "no-curl-results.json").write_text(json.dumps(results))
+PYEOF
+assert_equal "curl 없이 Task 없음 조회" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" idle)"
+assert_equal "curl 없이 실행 중 Task 집계" "1" "$(json_value "$TEST_ROOT/no-curl-results.json" busy)"
+assert_equal "curl 없이 잘못된 응답은 unknown" "unknown" "$(json_value "$TEST_ROOT/no-curl-results.json" invalid)"
+assert_equal "curl 없이 HTTP 오류는 unknown" "unknown" "$(json_value "$TEST_ROOT/no-curl-results.json" error)"
+assert_equal "curl 없이 실행 중 Task가 있으면 대기" "75" "$(json_value "$TEST_ROOT/no-curl-results.json" busyExit)"
+assert_equal "curl 없이 일반 업데이트 성공" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" updateExit)"
+assert_equal "curl 없이 설치 모드 성공" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" installExit)"
+assert_equal "일반 업데이트는 시작 전에만 Task API 조회" "1" "$(json_value "$TEST_ROOT/no-curl-results.json" updateRequests)"
+assert_equal "설치 모드는 Task API를 조회하지 않음" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" installRequests)"
+assert_equal "Task 조회의 임시 파일 정리" "0" "$(json_value "$TEST_ROOT/no-curl-results.json" temporaryFiles)"
+cp "$ACS_ROOT/services/state/state.amd64.bin" "$TEST_ROOT/state-before-gateway.bin"
+cp "$ACS_ROOT/deploy/installed.json" "$TEST_ROOT/installed-before-gateway.json"
+for failure in config reload; do
+  touch "$FAKE_STATE_DIR/gateway-$failure-fails"
+  : > "$FAKE_LOG"
+  assert_equal "Gateway $failure 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v3-state.zip")"
+  assert_equal "Gateway $failure 실패는 기존 복구 처리" "rollback" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+  assert_true "Gateway $failure 실패 시 이전 bin 복원" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
+  assert_equal "Gateway $failure 실패 시 설치 버전 보존" "v2" "$(json_value "$ACS_ROOT/deploy/installed.json" version)"
+  rm -f "$FAKE_STATE_DIR/gateway-$failure-fails"
+  cp "$TEST_ROOT/state-before-gateway.bin" "$ACS_ROOT/services/state/state.amd64.bin"
+  cp "$TEST_ROOT/installed-before-gateway.json" "$ACS_ROOT/deploy/installed.json"
+done
 
 echo "▶ sha256이 맞지 않으면 아무것도 바꾸지 않음"
 python3 -I - "$TEST_ROOT/acs-v3-state.zip" "$TEST_ROOT/acs-v3-broken.zip" <<'PYEOF'
@@ -334,11 +559,21 @@ assert_equal "되돌린 실행의 멈춘 단계는 health" "health" "$(json_valu
 rm -f "$FAKE_STATE_DIR/unhealthy-task"
 
 echo "▶ 필요한 이미지가 없으면 바꾸기 전에 멈춤"
+echo "grafana/loki:3.5.3" > "$FAKE_STATE_DIR/missing-image"
+assert_equal "Loki 이미지 없으면 실패" "1" "$(run_update "$TEST_ROOT/acs-v4-task.zip")"
+assert_equal "Loki 이미지 없으면 변경 전 중단" "images" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
 echo "mongo:7" > "$FAKE_STATE_DIR/missing-image"
 assert_equal "이미지 없음 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v4-task.zip")"
 assert_true "이미지 없음 메시지" grep -q "mongo:7" "$ACS_ROOT/deploy/status.json"
 assert_true "task bin은 v2 그대로" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
 rm -f "$FAKE_STATE_DIR/missing-image"
+
+echo "관측 기동 실패는 기존 복구 절차 사용"
+touch "$FAKE_STATE_DIR/observability-up-fails"
+assert_equal "수집기 기동 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v4-task.zip")"
+assert_equal "수집기 기동 실패는 기존 복구 처리" "rollback" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+assert_true "수집기 기동 실패 시 이전 bin 복원" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
+rm -f "$FAKE_STATE_DIR/observability-up-fails"
 
 echo "▶ observer: 성공 ZIP은 지우고, 대기 ZIP은 두고, 실패 ZIP은 failed/로"
 echo '{"source": "ui-upload"}' > "$ACS_ROOT/deploy/observe/acs-v4-task.zip.meta.json"
@@ -531,6 +766,7 @@ assert_equal "온라인 최초 설치 버전" "8.0.0" "$(json_value "$online_ins
 assert_true "온라인 최초 설치는 install ZIP 다운로드" grep -q "acs-v8-install.zip" "$FAKE_LOG"
 assert_true "--mode=develop은 develop 채널 latest.json" grep -q "acs/develop/latest.json" "$FAKE_LOG"
 assert_true "설치 뒤 받은 ZIP을 지움" test ! -e "$online_install_root/.download"
+cp "$online_install_root/site.env" "$TEST_ROOT/online-site-before-reinstall.env"
 : > "$FAKE_LOG"
 ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --root="$online_install_root" \
   --project=rb-acs-online-test --no-systemd >/dev/null 2>&1
@@ -540,6 +776,7 @@ assert_true "이미 최신이면 설치 ZIP을 받지 않음" bash -c "! grep -q
 ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --root="$online_install_root" \
   --project=rb-acs-online-test --reinstall --no-systemd >/dev/null 2>&1
 assert_true "--reinstall이면 같은 버전도 다시 받음" grep -q "acs-v8-install.zip" "$FAKE_LOG"
+assert_true "재설치해도 기존 설정과 비밀번호 보존" cmp -s "$TEST_ROOT/online-site-before-reinstall.env" "$online_install_root/site.env"
 failed_install_root="$TEST_ROOT/rb-acs-failed-download"
 FAKE_FAIL_PACKAGE=1 ACS_ENV_FILE="$TEST_ROOT/etc/acs-failed-env.conf" bash "$KIT_DIR/deploy.sh" --root="$failed_install_root" \
   --project=rb-acs-failed-test --no-systemd >/dev/null 2>&1

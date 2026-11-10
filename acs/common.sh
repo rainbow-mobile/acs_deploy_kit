@@ -207,7 +207,18 @@ wait_services_healthy() {  # <timeout_sec> <service...>
 
 # 끝나지 않은 Task 실행 수. Task 서비스가 응답하지 않으면 unknown(설치 전·서비스가 내려가 있음)을 출력한다.
 active_task_count() {
-  local executions_json
+  local executions_json temporary_directory
+  if ! command -v curl >/dev/null 2>&1; then
+    temporary_directory="$(mktemp -d)" || { echo "unknown"; return; }
+    if download_file "$ACS_GATEWAY_URL/task/execution/executions" "$temporary_directory/executions.json" 5 2>/dev/null; then
+      release_tool count-active < "$temporary_directory/executions.json" 2>/dev/null || echo "unknown"
+    else
+      echo "unknown"
+    fi
+    rm -f "$temporary_directory/executions.json" "$temporary_directory/.executions.json.part"
+    rmdir "$temporary_directory"
+    return
+  fi
   if executions_json="$(curl -fsS --max-time 5 "$ACS_GATEWAY_URL/task/execution/executions" 2>/dev/null)"; then
     printf '%s' "$executions_json" | release_tool count-active 2>/dev/null || echo "unknown"
   else

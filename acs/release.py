@@ -560,7 +560,7 @@ def installed_get(installed_name: str, key: str) -> None:
 def make_site_env(archive_name: str, site_env_name: str, frs_url: str, moms_url: str) -> None:
     """릴리즈 ZIP의 runtime/site.env.example로 현장 site.env를 만듭니다.
 
-    POSTGRES_PASSWORD는 예시 값으로 설치하지 않도록 무작위로 만들고, FRS·MOMS 주소는 받은 값이 있으면 넣습니다.
+    PostgreSQL·MongoDB의 관리자·운영·DDL 비밀번호를 각각 URI에 안전한 무작위 값으로 만들고, FRS·MOMS 주소는 받은 값이 있으면 넣습니다.
     설치 후 DB 비밀번호를 바꾸면 기존 DB에 접속하지 못하므로 이 파일은 처음 한 번만 만듭니다.
 
     Args:
@@ -571,7 +571,14 @@ def make_site_env(archive_name: str, site_env_name: str, frs_url: str, moms_url:
     """
     with zipfile.ZipFile(archive_name) as release_archive:
         example_lines = release_archive.read("runtime/site.env.example").decode("utf-8").splitlines()
-    replacements = {"POSTGRES_PASSWORD": secrets.token_urlsafe(24)}
+    replacements = {
+        "POSTGRES_PASSWORD": secrets.token_urlsafe(24),
+        "MONGO_INITDB_ROOT_PASSWORD": secrets.token_urlsafe(24),
+        "ACS_RUNTIME_PASSWORD_ENCODED": secrets.token_urlsafe(24),
+        "ACS_SCHEMA_PASSWORD_ENCODED": secrets.token_urlsafe(24),
+        "ACS_MONGO_RUNTIME_PASSWORD_ENCODED": secrets.token_urlsafe(24),
+        "ACS_MONGO_SCHEMA_PASSWORD_ENCODED": secrets.token_urlsafe(24),
+    }
     if frs_url:
         replacements["FRS_API_BASE_URL"] = frs_url
     if moms_url:

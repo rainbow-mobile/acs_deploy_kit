@@ -3,6 +3,11 @@
 RB ACS를 현장 PC에 설치하고 업데이트하는 최소 구성입니다. 키트 루트에는 제품별 폴더(`acs/`, 이후 `fms/`·`agent/` 등)를 두고,
 ACS 파일은 모두 이 `acs/` 폴더에 있습니다. 아래 명령은 `acs/` 폴더에서 실행합니다. 실행 흐름은 네 파일만 보면 됩니다.
 
+새 ACS 릴리즈 ZIP에 포함된 기존 Loki·Alloy는 `deploy.sh`와 온라인/ZIP `update.sh`에서 자동 기동합니다.
+DB 로그는 기존 정책으로 365일 보관하며 Prometheus·Grafana는 패키지와 기동 대상에서 제외합니다.
+기존 관측 Compose·포트·볼륨과 `site.env`는 유지하고, 설정이 바뀌면 두 수집기를 재생성합니다.
+별도 수집기 상태 조회·HTTP 요청은 추가하지 않습니다. 이미지 없는 서비스 ZIP은 필요한 이미지가 서버에 있어야 합니다.
+
 ```text
 deploy.sh     최초 설치와 observer 등록
 update.sh     ZIP 검증, 백업, 선택 서비스 교체, 실패 시 롤백
@@ -32,6 +37,7 @@ systemd 서비스 내용은 `deploy.sh`가 설치할 때 바로 생성합니다.
 ## 최초 설치
 
 온라인 설치가 기본입니다(2026-11-03). `--mode`로 채널을 고르고, 오프라인 설치만 `--input`으로 ZIP을 지정합니다.
+`site.env`가 없는 최초 설치에서는 ZIP의 예시 파일에 있는 비밀번호 여섯 개를 각각 별도 무작위 값으로 채웁니다. 관리자는 `POSTGRES_PASSWORD`·`MONGO_INITDB_ROOT_PASSWORD`, PostgreSQL 운영·스키마는 `ACS_RUNTIME_PASSWORD_ENCODED`·`ACS_SCHEMA_PASSWORD_ENCODED`, MongoDB 운영·스키마는 `ACS_MONGO_RUNTIME_PASSWORD_ENCODED`·`ACS_MONGO_SCHEMA_PASSWORD_ENCODED`를 사용합니다. 값은 URI에 안전한 문자로 생성하고 기존 `${...}` 참조는 유지합니다. 생성 파일 권한은 `0600`이며, 기존 공통 비밀번호를 사용하는 `site.env`와 `--site-env` 지정 설정도 재생성하지 않습니다.
 
 ```bash
 ./deploy.sh                                  # 온라인 main 채널 최신 통합 ZIP으로 설치
@@ -109,6 +115,9 @@ observer 자동 업데이트와 `update.sh --online`도 같은 채널을 봅니�
   매니페스트 version에 빌드 때 최신 통합 버전이 들어 있어도 서비스별 버전만 바꿉니다. 그래서 서비스 하나만 올린 뒤에도 새 통합 버전으로 업데이트할 수 있습니다.
   `bundle`이 없는 예전 ZIP은 설치된 서비스를 모두 담았을 때만 통합으로 봅니다. 되돌리기 보관본도 어느 쪽을 적용하기 전인지 `bundle`로 남깁니다.
 - DB 백업은 `backups/`에 최근 3개를 유지합니다. DB 자체는 자동 롤백하지 않습니다.
+- MongoDB 백업은 기존 `site.env`에서 컨테이너로 전달된 `MONGO_INITDB_ROOT_USERNAME`·`MONGO_INITDB_ROOT_PASSWORD`로 `admin` DB에 인증합니다. 백업에 실패하면 설정·서비스 bin을 교체하기 전에 중단합니다.
+- 서비스 준비 후 Gateway 설정을 검사하고 reload하여 바뀐 컨테이너 주소를 다시 조회합니다. 이후 추가 API 응답 검사 없이 성공으로 기록하며, 기존 서비스 healthcheck와 Gateway 설정 검사·reload의 실패는 기존 복구 처리를 실행합니다.
+- 업데이트 전 Task 실행 확인은 `curl`이 없어도 기존 다운로드 대체 경로의 Python 3 표준 라이브러리로 수행합니다. 별도 패키지를 설치하지 않으며 HTTP 오류나 잘못된 JSON은 기존처럼 응답 실패로 처리합니다.
 - 자동 복구 가능한 검사는 빌드 단계에서 먼저 고칩니다. 손상된 ZIP처럼 고칠 수 없는 오류는 기존 설치를 보존한 채 실패 처리합니다.
 
 ```bash
