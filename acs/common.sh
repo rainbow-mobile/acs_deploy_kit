@@ -4,6 +4,7 @@
 
 # 설치 설정 파일. deploy.sh가 쓰고 observer(root)가 읽는다. 테스트·sudo 없는 PC는 ACS_ENV_FILE로 바꾼다.
 ACS_ENV_FILE="${ACS_ENV_FILE:-/etc/rainbow/acs-env.conf}"
+# 키트의 acs/ 폴더입니다. 다른 제품(fms·agent 등)은 키트 루트 아래 자기 폴더를 씁니다.
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELEASE_TOOL="$KIT_DIR/release.py"
 DEFAULT_RELEASE_ORIGIN="https://diokjo4dtg1mp.cloudfront.net/acs"
@@ -15,7 +16,7 @@ load_acs_env() {
     . "$ACS_ENV_FILE"
   fi
   # 설치 디렉터리. compose·서비스 bin·deploy/가 여기 있다(Muscat DEPLOY_ROOT와 같은 역할).
-  ACS_ROOT="${ACS_ROOT:-$(dirname "$KIT_DIR")/rb-acs}"
+  ACS_ROOT="${ACS_ROOT:-$(dirname "$(dirname "$KIT_DIR")")/rb-acs}"
   # compose 프로젝트 이름. 컨테이너 이름이 <프로젝트>-<서비스>-1이 된다.
   ACS_PROJECT="${ACS_PROJECT:-rb-acs}"
   # 실행 중 Task 확인에 쓰는 Gateway 주소(호스트에서 접속).

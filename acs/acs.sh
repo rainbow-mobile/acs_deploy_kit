@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-# /usr/local/bin/acs 링크로 불러도 키트 폴더를 찾는다.
+# /usr/local/bin/acs 링크로 불러도 키트의 acs 폴더를 찾는다.
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # shellcheck source=common.sh
 . "$SCRIPT_DIR/common.sh"
