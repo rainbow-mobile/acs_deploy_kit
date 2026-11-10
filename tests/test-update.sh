@@ -40,7 +40,7 @@ if [ "${1:-}" = "compose" ]; then
       if [ -f "$FAKE_STATE_DIR/mongo-auth-required" ]; then
         case " $* " in
           *" mongo sh -c "*)
-            MONGO_INITDB_ROOT_USERNAME=backup_test_admin MONGO_INITDB_ROOT_PASSWORD='Backup@Test!#' bash -c "${!#}"
+            MONGO_INITDB_ROOT_USERNAME=backup_test_admin MONGO_INITDB_ROOT_PASSWORD='-Backup@Test!#' bash -c "${!#}"
             exit $? ;;
           *) exit 1 ;;
         esac
@@ -127,12 +127,13 @@ authentication_database=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --username) mongo_user="$2"; shift 2 ;;
-    --password) mongo_password="$2"; shift 2 ;;
+    --password) [[ "${2:-}" == -* ]] && exit 1; mongo_password="$2"; shift 2 ;;
+    --password=*) mongo_password="${1#*=}"; shift ;;
     --authenticationDatabase) authentication_database="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
-[ "$mongo_user" = backup_test_admin ] && [ "$mongo_password" = 'Backup@Test!#' ] && [ "$authentication_database" = admin ] || exit 1
+[ "$mongo_user" = backup_test_admin ] && [ "$mongo_password" = '-Backup@Test!#' ] && [ "$authentication_database" = admin ] || exit 1
 echo "mongo-backup"
 EOF
 chmod +x "$FAKE_BIN_DIR/mongodump"
@@ -171,7 +172,16 @@ for service_name in services_csv.split(","):
     services[service_name] = {"version": service_version, "path": path, "sha256": hashlib.sha256(content).hexdigest()}
 runtime_files = {
     "compose.yml": b"services: {}\n", "compose.offline.yml": f"# {version}\n".encode(), ".env": b"TASK_PORT=18002\n",
-    "site.env.example": b"# example\nPOSTGRES_PASSWORD=change-me\nFRS_API_BASE_URL=http://192.168.60.200:3000\nSMC_MOMS_URL=http://mock:18006\n",
+    "site.env.example": (
+        b"# example\nPOSTGRES_PASSWORD=change-me\nMONGO_INITDB_ROOT_USERNAME=acs_admin\n"
+        b"MONGO_INITDB_ROOT_PASSWORD=\nACS_RUNTIME_PASSWORD_ENCODED=\nACS_SCHEMA_PASSWORD_ENCODED=\n"
+        b"ACS_MONGO_RUNTIME_PASSWORD_ENCODED=\nACS_MONGO_SCHEMA_PASSWORD_ENCODED=\n"
+        b"SMC_DATABASE_URL=postgresql://runtime:${ACS_RUNTIME_PASSWORD_ENCODED}@postgres:5432/state\n"
+        b"SMC_SCHEMA_DATABASE_URL=postgresql://schema:${ACS_SCHEMA_PASSWORD_ENCODED}@postgres:5432/state\n"
+        b"SM_MONGO_URI=mongodb://runtime:${ACS_MONGO_RUNTIME_PASSWORD_ENCODED}@mongo:27017/?authSource=admin\n"
+        b"TASK_MONGO_SCHEMA_URI=mongodb://schema:${ACS_MONGO_SCHEMA_PASSWORD_ENCODED}@mongo:27017/?authSource=admin\n"
+        b"FRS_API_BASE_URL=http://192.168.60.200:3000\nSMC_MOMS_URL=http://mock:18006\n"
+    ),
     "api-gateway/servers/smc.conf": smc_conf.encode(), "zenoh-router-acs/zenoh.json5": b"{}\n",
 }
 for relative_path, content in runtime_files.items():
@@ -242,6 +252,38 @@ assert_true "최초 설치는 이전 버전 보관본이 없음" bash -c "! ls '
 assert_equal "온라인 자동배포 기본값은 꺼짐" "0" "$(bash -c '. "$1"; echo "$ACS_ONLINE_AUTO_UPDATE"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 채널" "main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_CHANNEL"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 주소" "https://diokjo4dtg1mp.cloudfront.net/acs/main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_BASE_URL"' _ "$ACS_ENV_FILE")"
+
+echo "최초 설정: 관리자·운영·DDL 비밀번호 생성과 기존 설정 보존"
+python3 -I - "$ACS_ROOT/site.env" > "$TEST_ROOT/generated-password-check.json" <<'PYEOF'
+import json, re, sys
+from pathlib import Path
+settings = dict(line.split("=", 1) for line in Path(sys.argv[1]).read_text().splitlines() if line and not line.startswith("#") and "=" in line)
+passwords = [settings.get(name, "") for name in ("POSTGRES_PASSWORD", "MONGO_INITDB_ROOT_PASSWORD", "ACS_RUNTIME_PASSWORD_ENCODED", "ACS_SCHEMA_PASSWORD_ENCODED", "ACS_MONGO_RUNTIME_PASSWORD_ENCODED", "ACS_MONGO_SCHEMA_PASSWORD_ENCODED")]
+print(json.dumps({
+    "complete": all(passwords),
+    "distinct": len(set(passwords)) == 6,
+    "url_safe": all(len(password) >= 24 and re.fullmatch(r"[A-Za-z0-9_-]+", password) for password in passwords),
+    "references_preserved": "${ACS_RUNTIME_PASSWORD_ENCODED}" in settings["SMC_DATABASE_URL"] and "${ACS_SCHEMA_PASSWORD_ENCODED}" in settings["SMC_SCHEMA_DATABASE_URL"] and "${ACS_MONGO_RUNTIME_PASSWORD_ENCODED}" in settings["SM_MONGO_URI"] and "${ACS_MONGO_SCHEMA_PASSWORD_ENCODED}" in settings["TASK_MONGO_SCHEMA_URI"],
+    "passwords_not_logged": not any(password and password in (Path(sys.argv[1]).parent / "deploy/update.log").read_text() for password in passwords),
+}))
+PYEOF
+assert_equal "필수 비밀번호 여섯 항목 모두 생성" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" complete)"
+assert_equal "각 계정의 비밀번호를 별도로 생성" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" distinct)"
+assert_equal "생성된 비밀번호는 URI에 사용할 수 있음" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" url_safe)"
+assert_equal "기존 URI 변수 참조 유지" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" references_preserved)"
+assert_equal "생성된 비밀번호는 배포 로그에 출력하지 않음" "True" "$(json_value "$TEST_ROOT/generated-password-check.json" passwords_not_logged)"
+python3 -I - "$ACS_ROOT/site.env" "$TEST_ROOT/provided-site.env" <<'PYEOF'
+from pathlib import Path
+import sys
+contents = "\n".join(line for line in Path(sys.argv[1]).read_text().splitlines() if not line.startswith(("ACS_MONGO_RUNTIME_PASSWORD_ENCODED=", "ACS_MONGO_SCHEMA_PASSWORD_ENCODED="))) + "\n"
+contents = contents.replace("${ACS_MONGO_RUNTIME_PASSWORD_ENCODED}", "${ACS_RUNTIME_PASSWORD_ENCODED}").replace("${ACS_MONGO_SCHEMA_PASSWORD_ENCODED}", "${ACS_SCHEMA_PASSWORD_ENCODED}")
+Path(sys.argv[2]).write_text(contents)
+PYEOF
+printf '\n# 현장 설정 보존 검사\n' >> "$TEST_ROOT/provided-site.env"
+ACS_ENV_FILE="$TEST_ROOT/etc/provided-env.conf" bash "$KIT_DIR/deploy.sh" --input="$TEST_ROOT/acs-v1.zip" \
+  --root="$TEST_ROOT/rb-acs-provided" --site-env="$TEST_ROOT/provided-site.env" --no-systemd >/dev/null 2>&1
+assert_equal "사용자 설정을 지정한 설치 성공" "0" "$?"
+assert_true "기존 공통 비밀번호 설정도 그대로 복사" cmp -s "$TEST_ROOT/provided-site.env" "$TEST_ROOT/rb-acs-provided/site.env"
 
 echo "▶ acs 명령: 설치한 서비스 상태·실행·중지·재시작·로그 (업데이트 중이면 거절)"
 : > "$FAKE_LOG"
@@ -331,7 +373,7 @@ touch "$FAKE_STATE_DIR/mongo-auth-required"
 : > "$FAKE_LOG"
 assert_equal "인증이 필요한 MongoDB 백업도 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
 assert_true "관리자 이름은 컨테이너 환경에서 읽음" grep -Fq -- '--username "$MONGO_INITDB_ROOT_USERNAME"' "$FAKE_LOG"
-assert_true "관리자 비밀번호는 컨테이너 환경에서 읽음" grep -Fq -- '--password "$MONGO_INITDB_ROOT_PASSWORD"' "$FAKE_LOG"
+assert_true "관리자 비밀번호는 선두 -도 포함한 값으로 전달" grep -Fq -- '--password="$MONGO_INITDB_ROOT_PASSWORD"' "$FAKE_LOG"
 assert_true "MongoDB 관리자 인증 DB 지정" grep -Fq -- '--authenticationDatabase admin' "$FAKE_LOG"
 assert_true "특수문자가 포함된 비밀번호는 로그에 출력하지 않음" bash -c '! grep -Fq -- "Backup@Test!#" "$1" "$2"' _ "$FAKE_LOG" "$ACS_ROOT/deploy/update.log"
 cp "$ACS_ROOT/site.env" "$TEST_ROOT/site-before-mongo-failure.env"
@@ -615,6 +657,7 @@ assert_equal "온라인 최초 설치 버전" "8.0.0" "$(json_value "$online_ins
 assert_true "온라인 최초 설치는 install ZIP 다운로드" grep -q "acs-v8-install.zip" "$FAKE_LOG"
 assert_true "--mode=develop은 develop 채널 latest.json" grep -q "acs/develop/latest.json" "$FAKE_LOG"
 assert_true "설치 뒤 받은 ZIP을 지움" test ! -e "$online_install_root/.download"
+cp "$online_install_root/site.env" "$TEST_ROOT/online-site-before-reinstall.env"
 : > "$FAKE_LOG"
 ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --root="$online_install_root" \
   --project=rb-acs-online-test --no-systemd >/dev/null 2>&1
@@ -624,6 +667,7 @@ assert_true "이미 최신이면 설치 ZIP을 받지 않음" bash -c "! grep -q
 ACS_ENV_FILE="$online_install_env" bash "$KIT_DIR/deploy.sh" --root="$online_install_root" \
   --project=rb-acs-online-test --reinstall --no-systemd >/dev/null 2>&1
 assert_true "--reinstall이면 같은 버전도 다시 받음" grep -q "acs-v8-install.zip" "$FAKE_LOG"
+assert_true "재설치해도 기존 설정과 비밀번호 보존" cmp -s "$TEST_ROOT/online-site-before-reinstall.env" "$online_install_root/site.env"
 failed_install_root="$TEST_ROOT/rb-acs-failed-download"
 FAKE_FAIL_PACKAGE=1 ACS_ENV_FILE="$TEST_ROOT/etc/acs-failed-env.conf" bash "$KIT_DIR/deploy.sh" --root="$failed_install_root" \
   --project=rb-acs-failed-test --no-systemd >/dev/null 2>&1

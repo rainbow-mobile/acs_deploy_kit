@@ -31,6 +31,7 @@ tests/
 ## 최초 설치
 
 온라인 설치가 기본입니다(2026-11-03). `--mode`로 채널을 고르고, 오프라인 설치만 `--input`으로 ZIP을 지정합니다.
+`site.env`가 없는 최초 설치에서는 ZIP의 예시 파일에 있는 비밀번호 여섯 개를 각각 별도 무작위 값으로 채웁니다. 관리자는 `POSTGRES_PASSWORD`·`MONGO_INITDB_ROOT_PASSWORD`, PostgreSQL 운영·스키마는 `ACS_RUNTIME_PASSWORD_ENCODED`·`ACS_SCHEMA_PASSWORD_ENCODED`, MongoDB 운영·스키마는 `ACS_MONGO_RUNTIME_PASSWORD_ENCODED`·`ACS_MONGO_SCHEMA_PASSWORD_ENCODED`를 사용합니다. 값은 URI에 안전한 문자로 생성하고 기존 `${...}` 참조는 유지합니다. 생성 파일 권한은 `0600`이며, 기존 공통 비밀번호를 사용하는 `site.env`와 `--site-env` 지정 설정도 재생성하지 않습니다.
 
 ```bash
 ./deploy.sh                                  # 온라인 main 채널 최신 통합 ZIP으로 설치

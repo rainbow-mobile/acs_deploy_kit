@@ -292,7 +292,7 @@ if [ "$INSTALL_MODE" -eq 0 ] && [ -n "$(acs_compose ps -q mongo 2>/dev/null)" ];
   acs_compose exec -T mongo sh -c '
     exec mongodump \
       --username "$MONGO_INITDB_ROOT_USERNAME" \
-      --password "$MONGO_INITDB_ROOT_PASSWORD" \
+      --password="$MONGO_INITDB_ROOT_PASSWORD" \
       --authenticationDatabase admin \
       --archive --gzip --quiet
   ' > "$backup_dir/mongo.archive.gz" \
