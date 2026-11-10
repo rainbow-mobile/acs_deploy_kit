@@ -26,11 +26,19 @@ if [ "${1:-}" = "compose" ]; then
   case " $* " in
     *" version --short "*) echo "2.39.1"; exit 0 ;;
     *" version "*) echo "Docker Compose version v2.39.1"; exit 0 ;;
-    *" config --images "*) for image_name in $FAKE_IMAGES; do echo "$image_name"; done; exit 0 ;;
+    *" config --images "*)
+      if [[ "$*" == *infrastructure/observability/compose.yml* ]]; then
+        printf '%s\n' grafana/loki:3.5.3 grafana/alloy:v1.10.2
+      else
+        for image_name in $FAKE_IMAGES; do echo "$image_name"; done
+      fi
+      exit 0 ;;
     *" ps -q "*) echo "cid-${!#}"; exit 0 ;;
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
     *" ps -a --services "*|*" ps --services --status running "*) [ -f "$FAKE_STATE_DIR/containers-created" ] && printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres; exit 0 ;;
-    *" up "*) touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
+    *" up "*)
+      [[ "$*" == *infrastructure/observability/compose.yml* ]] && [ -f "$FAKE_STATE_DIR/observability-up-fails" ] && exit 1
+      touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
     *" exec -T api-gateway nginx -t "*) [ -f "$FAKE_STATE_DIR/gateway-config-fails" ] && exit 1; exit 0 ;;
     *" exec -T api-gateway nginx -s reload "*)
       [ -f "$FAKE_STATE_DIR/gateway-reload-fails" ] && exit 1
@@ -173,6 +181,9 @@ runtime_files = {
         b"FRS_API_BASE_URL=http://192.168.60.200:3000\nSMC_MOMS_URL=http://mock:18006\n"
     ),
     "api-gateway/servers/smc.conf": smc_conf.encode(), "zenoh-router-acs/zenoh.json5": b"{}\n",
+    "infrastructure/observability/compose.yml": b"name: rb-acs-observability\nservices: {}\n",
+    "infrastructure/observability/loki/loki.yaml": f"# {version}\nlimits_config:\n  retention_period: 720h\n".encode(),
+    "infrastructure/observability/alloy/config.alloy": b"// existing Alloy\n",
 }
 for relative_path, content in runtime_files.items():
     entries[f"runtime/{relative_path}"] = content
@@ -239,6 +250,8 @@ assert_true "이미지 load" grep -q "docker load -i" "$FAKE_LOG"
 assert_true "최초 설치는 DB 백업을 하지 않음" bash -c "! grep -q mongodump '$FAKE_LOG'"
 assert_true "최초 설치는 compose up이 만든 컨테이너를 다시 재시작하지 않음" bash -c "! grep -q ' restart ' '$FAKE_LOG'"
 assert_true "최초 설치는 이전 버전 보관본이 없음" bash -c "! ls '$ACS_ROOT'/deploy/archives/*.zip >/dev/null 2>&1"
+assert_true "최초 설치는 기존 Loki·Alloy 자동 기동" grep -E -q 'infrastructure/observability/compose.yml up -d .*loki alloy' "$FAKE_LOG"
+assert_true "수집기 상태 조회를 추가하지 않음" bash -c "! grep -E 'inspect .*cid-(loki|alloy)|infrastructure/observability/compose.yml ps|curl .*:(3100|12345)' '$FAKE_LOG'"
 assert_equal "온라인 자동배포 기본값은 꺼짐" "0" "$(bash -c '. "$1"; echo "$ACS_ONLINE_AUTO_UPDATE"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 채널" "main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_CHANNEL"' _ "$ACS_ENV_FILE")"
 assert_equal "온라인 기본 주소" "https://diokjo4dtg1mp.cloudfront.net/acs/main" "$(bash -c '. "$1"; echo "$ACS_RELEASE_BASE_URL"' _ "$ACS_ENV_FILE")"
@@ -311,6 +324,8 @@ assert_true "링크로 불러도 같은 compose" grep -q "restart task" "$FAKE_L
 
 echo "▶ 현장 파일은 업데이트가 덮어쓰지 않음 + Task만 바꾸는 부분 업데이트"
 echo "listen 13105; # 현장 수정" > "$ACS_ROOT/api-gateway/servers/smc.conf"
+echo '# 현장 관측 포트·볼륨 유지' >> "$ACS_ROOT/infrastructure/observability/compose.yml"
+cp "$ACS_ROOT/infrastructure/observability/compose.yml" "$TEST_ROOT/observability-before-update.yml"
 : > "$FAKE_LOG"
 assert_equal "v2(task) 적용 종료 코드" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
 assert_true "task bin은 v2" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
@@ -319,6 +334,8 @@ assert_equal "서비스별 버전(task)" "v2" "$(json_value "$ACS_ROOT/deploy/in
 assert_equal "서비스별 버전(state)" "v1" "$(json_value "$ACS_ROOT/deploy/installed.json" services.state.version)"
 assert_equal "이미지 없는 ZIP은 설치된 이미지 태그 유지" "v1" "$(json_value "$ACS_ROOT/deploy/installed.json" images_tag)"
 assert_true "현장 서버 블록 보존" grep -q "현장 수정" "$ACS_ROOT/api-gateway/servers/smc.conf"
+assert_true "현장 관측 Compose 보존" cmp -s "$TEST_ROOT/observability-before-update.yml" "$ACS_ROOT/infrastructure/observability/compose.yml"
+assert_true "변경된 DB 보관 설정 재적용" grep -E -q 'infrastructure/observability/compose.yml up -d .*--force-recreate.*loki alloy' "$FAKE_LOG"
 assert_true "업데이트 전 DB 백업" bash -c "ls '$ACS_ROOT'/backups/*-v2/mongo.archive.gz >/dev/null"
 assert_true "task 재시작" grep -q "restart task" "$FAKE_LOG"
 assert_true "바뀐 설정이 없으면 Gateway 재시작 안 함" bash -c "! grep -q 'restart task api-gateway' '$FAKE_LOG'"
@@ -354,7 +371,7 @@ assert_equal "다시 v2 적용" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
 echo "▶ 설정 파일이 그대로면 compose up 없이 바뀐 서비스만 재시작"
 : > "$FAKE_LOG"
 assert_equal "같은 설정으로 v2(task) 다시 적용" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
-assert_true "compose up 생략" bash -c "! grep -q ' up ' '$FAKE_LOG'"
+assert_true "ACS compose up 생략" bash -c "! grep ' up ' '$FAKE_LOG' | grep -v 'infrastructure/observability/compose.yml'"
 assert_true "task만 재시작" grep -q "restart task$" "$FAKE_LOG"
 assert_true "로그에 생략 이유" grep -q "compose up을 건너뜁니다" "$ACS_ROOT/deploy/update.log"
 
@@ -536,11 +553,21 @@ assert_equal "되돌린 실행의 멈춘 단계는 health" "health" "$(json_valu
 rm -f "$FAKE_STATE_DIR/unhealthy-task"
 
 echo "▶ 필요한 이미지가 없으면 바꾸기 전에 멈춤"
+echo "grafana/loki:3.5.3" > "$FAKE_STATE_DIR/missing-image"
+assert_equal "Loki 이미지 없으면 실패" "1" "$(run_update "$TEST_ROOT/acs-v4-task.zip")"
+assert_equal "Loki 이미지 없으면 변경 전 중단" "images" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
 echo "mongo:7" > "$FAKE_STATE_DIR/missing-image"
 assert_equal "이미지 없음 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v4-task.zip")"
 assert_true "이미지 없음 메시지" grep -q "mongo:7" "$ACS_ROOT/deploy/status.json"
 assert_true "task bin은 v2 그대로" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
 rm -f "$FAKE_STATE_DIR/missing-image"
+
+echo "관측 기동 실패는 기존 복구 절차 사용"
+touch "$FAKE_STATE_DIR/observability-up-fails"
+assert_equal "수집기 기동 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v4-task.zip")"
+assert_equal "수집기 기동 실패는 기존 복구 처리" "rollback" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+assert_true "수집기 기동 실패 시 이전 bin 복원" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
+rm -f "$FAKE_STATE_DIR/observability-up-fails"
 
 echo "▶ observer: 성공 ZIP은 지우고, 대기 ZIP은 두고, 실패 ZIP은 failed/로"
 echo '{"source": "ui-upload"}' > "$ACS_ROOT/deploy/observe/acs-v4-task.zip.meta.json"

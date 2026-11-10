@@ -2,6 +2,11 @@
 
 RB ACS를 현장 PC에 설치하고 업데이트하는 최소 구성입니다. 실행 흐름은 네 파일만 보면 됩니다.
 
+새 ACS 릴리즈 ZIP에 포함된 기존 Loki·Alloy는 `deploy.sh`와 온라인/ZIP `update.sh`에서 자동 기동합니다.
+DB 로그는 기존 정책으로 365일 보관하며 Prometheus·Grafana는 패키지와 기동 대상에서 제외합니다.
+기존 관측 Compose·포트·볼륨과 `site.env`는 유지하고, 설정이 바뀌면 두 수집기를 재생성합니다.
+별도 수집기 상태 조회·HTTP 요청은 추가하지 않습니다. 이미지 없는 서비스 ZIP은 필요한 이미지가 서버에 있어야 합니다.
+
 ```text
 deploy.sh     최초 설치와 observer 등록
 update.sh     ZIP 검증, 백업, 선택 서비스 교체, 실패 시 롤백

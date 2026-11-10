@@ -150,6 +150,8 @@ ROLLBACK_DIR="$ACS_ROOT/.rollback"
 BIN_ARCH="$(host_arch)"
 UPDATED_SERVICES=()
 CURRENT_STAGE="wait_tasks"
+# 이번 적용에서 기동한 관측 Compose만 기존 롤백 절차에 포함합니다.
+observability_compose=()
 
 cleanup_staging() {
   rm -rf "$STAGING_DIR" "$STAGING_DIR.err"
@@ -192,6 +194,7 @@ fail_with_rollback() {  # <message>
 
 rollback_changes() {
   local relative_path service_name bin_name
+  [ ${#observability_compose[@]} -eq 0 ] || "${observability_compose[@]}" stop loki alloy || true
   if [ -d "$ROLLBACK_DIR/runtime" ]; then
     (cd "$ROLLBACK_DIR/runtime" && find . -type f -printf '%P\n') | while IFS= read -r relative_path; do
       install -D -m 644 "$ROLLBACK_DIR/runtime/$relative_path" "$ACS_ROOT/$relative_path"
@@ -212,6 +215,9 @@ rollback_changes() {
   acs_compose up -d --no-build --pull never --remove-orphans || true
   [ ${#UPDATED_SERVICES[@]} -gt 0 ] && acs_compose restart "${UPDATED_SERVICES[@]}" || true
   acs_compose restart api-gateway zenoh-router >/dev/null 2>&1 || true
+  if [ ${#observability_compose[@]} -gt 0 ] && [ -f "$ACS_ROOT/infrastructure/observability/compose.yml" ]; then
+    "${observability_compose[@]}" up -d --pull never --force-recreate loki alloy || true
+  fi
 }
 
 log "════ 업데이트 시작: $CURRENT_PACKAGE (설치=$INSTALL_MODE, 강제=$FORCE_MODE, 출처=$RUN_SOURCE, 실행 ID=$RUN_ID)"
@@ -277,6 +283,14 @@ staged_compose_files=(-f "$STAGING_DIR/runtime/compose.yml" -f "$STAGING_DIR/run
 required_images="$(docker compose -p "$ACS_PROJECT" --project-directory "$ACS_ROOT" --env-file "$STAGING_DIR/runtime/.env.with-tag" --env-file "$ACS_ROOT/site.env" "${staged_compose_files[@]}" config --images 2> "$STAGING_DIR.err")" \
   || fail_without_changes "새 compose 설정을 해석하지 못했습니다: $(tail -n 3 "$STAGING_DIR.err")"
 rm -f "$STAGING_DIR.err"
+observability_compose_path="$STAGING_DIR/runtime/infrastructure/observability/compose.yml"
+[ -f "$ACS_ROOT/infrastructure/observability/compose.yml" ] && observability_compose_path="$ACS_ROOT/infrastructure/observability/compose.yml"
+if [ -f "$observability_compose_path" ]; then
+  observability_images="$(docker compose -f "$observability_compose_path" config --images loki alloy 2> "$STAGING_DIR.err")" \
+    || fail_without_changes "로그 수집 설정을 해석하지 못했습니다: $(tail -n 3 "$STAGING_DIR.err")"
+  required_images+=$'\n'"$observability_images"
+  rm -f "$STAGING_DIR.err"
+fi
 missing_images=()
 for image_name in $required_images; do
   docker image inspect "$image_name" >/dev/null 2>&1 || missing_images+=("$image_name")
@@ -336,6 +350,7 @@ while IFS= read -r relative_path; do
   # Gateway 외부 플랫폼 서버 블록은 현장에서 고치는 파일이라 없을 때만 놓는다.
   case "$relative_path" in
     api-gateway/servers/*) [ -f "$target_path" ] && continue ;;
+    infrastructure/observability/compose.yml) [ -f "$target_path" ] && continue ;;
   esac
   if [ -f "$target_path" ]; then
     cmp -s "$source_path" "$target_path" && continue
@@ -409,6 +424,17 @@ fi
 # 앱 재시작으로 바뀐 주소를 서비스 준비 후 다시 조회합니다.
 acs_compose exec -T api-gateway nginx -t || fail_with_rollback "Gateway 설정 검사에 실패했습니다"
 acs_compose exec -T api-gateway nginx -s reload || fail_with_rollback "Gateway 설정 갱신에 실패했습니다"
+
+if [ -f "$ACS_ROOT/infrastructure/observability/compose.yml" ]; then
+  observability_compose=(docker compose -f "$ACS_ROOT/infrastructure/observability/compose.yml")
+  observability_arguments=()
+  # 기존 변경 파일 목록만 사용해 설정이 바뀐 배포에서 재적용합니다. 별도 상태 조회는 하지 않습니다.
+  for relative_path in "${changed_runtime_paths[@]}"; do
+    case "$relative_path" in infrastructure/observability/*) observability_arguments=(--force-recreate); break ;; esac
+  done
+  "${observability_compose[@]}" up -d --pull never "${observability_arguments[@]}" loki alloy \
+    || fail_with_rollback "로그 수집기 기동에 실패했습니다"
+fi
 
 # ── done ─────────────────────────────────────────
 CURRENT_STAGE="done"
