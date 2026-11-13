@@ -181,7 +181,9 @@ fail_with_rollback() {  # <message>
   write_status running rollback "$failure_message. 이전 버전으로 되돌리는 중"
   rollback_changes
   local rollback_result="이전 버전으로 되돌렸습니다"
-  if ! wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${ACS_SERVICES[@]}" >/dev/null; then
+  local rollback_health_targets=("${ACS_SERVICES[@]}")
+  [ -n "$(acs_compose ps -q keycloak 2>/dev/null)" ] && rollback_health_targets+=(keycloak)
+  if ! wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${rollback_health_targets[@]}" >/dev/null; then
     rollback_result="되돌린 뒤에도 일부 서비스가 healthy가 아닙니다. docker compose 상태와 $UPDATE_LOG 로그를 확인하세요"
     note_error "$rollback_result"
   fi
@@ -314,6 +316,10 @@ if [ "$INSTALL_MODE" -eq 0 ] && [ -n "$(acs_compose ps -q mongo 2>/dev/null)" ];
   if [ -n "$(acs_compose ps -q postgres 2>/dev/null)" ]; then
     acs_compose exec -T postgres pg_dump -U state -d state | gzip > "$backup_dir/postgres.sql.gz" \
       || fail_without_changes "PostgreSQL 백업에 실패했습니다. 아무것도 바꾸지 않았습니다."
+    if [ -n "$(acs_compose ps -q keycloak 2>/dev/null)" ]; then
+      acs_compose exec -T postgres pg_dump -U state -d keycloak | gzip > "$backup_dir/keycloak.sql.gz" \
+        || fail_without_changes "Keycloak DB 백업에 실패했습니다. 아무것도 바꾸지 않았습니다."
+    fi
   fi
   log "DB 백업: $backup_dir"
   # 오래된 백업은 BACKUP_KEEP개만 남긴다.
@@ -393,6 +399,10 @@ compose_up_needed=0
 for service_name in "${ACS_SERVICES[@]}" api-gateway zenoh-router mongo postgres; do
   [[ "$running_services" == *" $service_name "* ]] || compose_up_needed=1
 done
+if { [[ "$existing_services" == *" keycloak "* ]] || grep -q '^  keycloak:' "$ACS_ROOT/compose.offline.yml" 2>/dev/null; } \
+  && [[ "$running_services" != *" keycloak "* ]]; then
+  compose_up_needed=1
+fi
 if [ "$compose_up_needed" -eq 1 ]; then
   acs_compose up -d --no-build --pull never --remove-orphans || fail_with_rollback "compose up에 실패했습니다"
 else
@@ -403,6 +413,7 @@ for relative_path in "${changed_runtime_paths[@]}"; do
   case "$relative_path" in
     api-gateway/*) [[ " ${candidate_targets[*]} " == *" api-gateway "* ]] || candidate_targets+=(api-gateway) ;;
     zenoh-router-acs/*) [[ " ${candidate_targets[*]} " == *" zenoh-router "* ]] || candidate_targets+=(zenoh-router) ;;
+    infrastructure/keycloak/*) [[ " ${candidate_targets[*]} " == *" keycloak "* ]] || candidate_targets+=(keycloak) ;;
   esac
 done
 restart_targets=()
@@ -417,7 +428,9 @@ fi
 # ── health ───────────────────────────────────────
 CURRENT_STAGE="health"
 write_status running health "서비스가 정상 기동하는지 확인하는 중"
-if ! unhealthy_services="$(wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${ACS_SERVICES[@]}")"; then
+health_targets=("${ACS_SERVICES[@]}")
+[ -n "$(acs_compose ps -q keycloak 2>/dev/null)" ] && health_targets+=(keycloak)
+if ! unhealthy_services="$(wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${health_targets[@]}")"; then
   fail_with_rollback "헬스체크 실패(${HEALTH_TIMEOUT_SEC}초): $unhealthy_services"
 fi
 

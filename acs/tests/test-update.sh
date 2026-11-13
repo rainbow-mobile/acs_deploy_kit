@@ -33,9 +33,22 @@ if [ "${1:-}" = "compose" ]; then
         for image_name in $FAKE_IMAGES; do echo "$image_name"; done
       fi
       exit 0 ;;
-    *" ps -q "*) echo "cid-${!#}"; exit 0 ;;
+    *" ps -q "*)
+      [ "${!#}" = "keycloak" ] && [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] && exit 0
+      echo "cid-${!#}"; exit 0 ;;
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
-    *" ps -a --services "*|*" ps --services --status running "*) [ -f "$FAKE_STATE_DIR/containers-created" ] && printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres; exit 0 ;;
+    *" ps --services --status running "*)
+      if [ -f "$FAKE_STATE_DIR/containers-created" ]; then
+        printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres
+        [ -f "$FAKE_STATE_DIR/keycloak-stopped" ] || [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] || echo keycloak
+      fi
+      exit 0 ;;
+    *" ps -a --services "*)
+      if [ -f "$FAKE_STATE_DIR/containers-created" ]; then
+        printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres
+        [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] || echo keycloak
+      fi
+      exit 0 ;;
     *" up "*)
       [[ "$*" == *infrastructure/observability/compose.yml* ]] && [ -f "$FAKE_STATE_DIR/observability-up-fails" ] && exit 1
       touch "$FAKE_STATE_DIR/containers-created"; exit 0 ;;
@@ -54,7 +67,12 @@ if [ "${1:-}" = "compose" ]; then
         esac
       fi
       echo "mongo-backup"; exit 0 ;;
-    *" pg_dump "*) echo "pg-backup"; exit 0 ;;
+    *" pg_dump "*)
+      if [[ " $* " == *" -d keycloak "* ]]; then
+        [ -f "$FAKE_STATE_DIR/keycloak-backup-fails" ] && exit 1
+        echo "pg-backup-keycloak"; exit 0
+      fi
+      echo "pg-backup"; exit 0 ;;
     *) exit 0 ;;
   esac
 fi
@@ -176,6 +194,10 @@ runtime_files = {
         b"# example\nPOSTGRES_PASSWORD=change-me\nMONGO_INITDB_ROOT_USERNAME=acs_admin\n"
         b"MONGO_INITDB_ROOT_PASSWORD=\nACS_RUNTIME_PASSWORD_ENCODED=\nACS_SCHEMA_PASSWORD_ENCODED=\n"
         b"ACS_MONGO_RUNTIME_PASSWORD_ENCODED=\nACS_MONGO_SCHEMA_PASSWORD_ENCODED=\n"
+        b"KC_DB_URL=jdbc:postgresql://postgres:5432/keycloak\nKC_DB_USERNAME=keycloak\nKC_DB_PASSWORD=\n"
+        b"KC_BOOTSTRAP_ADMIN_USERNAME=keycloak_admin\nKC_BOOTSTRAP_ADMIN_PASSWORD=\n"
+        b"ACS_PUBLIC_ORIGIN=http://192.168.60.200:13000\nAUTH_ENABLED=true\n"
+        b"MOMS_WEBHOOK_CLIENT_SECRET=\nACS_ADMIN_USERNAME=acsadmin\nACS_ADMIN_PASSWORD=\n"
         b"SMC_DATABASE_URL=postgresql://runtime:${ACS_RUNTIME_PASSWORD_ENCODED}@postgres:5432/state\n"
         b"SMC_SCHEMA_DATABASE_URL=postgresql://schema:${ACS_SCHEMA_PASSWORD_ENCODED}@postgres:5432/state\n"
         b"SM_MONGO_URI=mongodb://runtime:${ACS_MONGO_RUNTIME_PASSWORD_ENCODED}@mongo:27017/?authSource=admin\n"
@@ -856,6 +878,213 @@ assert_equal "옛 observer 경로 종료 코드" "0" "$?"
 assert_true "옛 observer 경로도 heartbeat 기록" test -f "$ACS_ROOT/deploy/observer.json"
 assert_equal "옛 release_tool 경로" "true" "$(python3 -I "$KIT_DIR/lib/release_tool.py" version-is-newer 1.0.1 0.1.2)"
 assert_equal "옛 update 경로는 사용법 오류(2)로 새 update.sh에 넘김" "2" "$(bash "$KIT_DIR/acs-update.sh" >/dev/null 2>&1; echo $?)"
+
+echo "Keycloak 연동: 초기 비밀값 생성·--public-origin·DB 백업·헬스체크·acs 명령·M2M Task 조회"
+python3 -I - "$ACS_ROOT/site.env" > "$TEST_ROOT/keycloak-secret-check.json" <<'PYEOF'
+import json, re, sys
+from pathlib import Path
+settings = dict(line.split("=", 1) for line in Path(sys.argv[1]).read_text().splitlines() if line and not line.startswith("#") and "=" in line)
+secret_names = (
+    "POSTGRES_PASSWORD", "MONGO_INITDB_ROOT_PASSWORD",
+    "ACS_RUNTIME_PASSWORD_ENCODED", "ACS_SCHEMA_PASSWORD_ENCODED",
+    "ACS_MONGO_RUNTIME_PASSWORD_ENCODED", "ACS_MONGO_SCHEMA_PASSWORD_ENCODED",
+    "KC_DB_PASSWORD", "KC_BOOTSTRAP_ADMIN_PASSWORD",
+    "MOMS_WEBHOOK_CLIENT_SECRET", "ACS_ADMIN_PASSWORD",
+)
+secrets_list = [settings.get(name, "") for name in secret_names]
+admin_password = settings.get("ACS_ADMIN_PASSWORD", "")
+log_text = (Path(sys.argv[1]).parent / "deploy/update.log").read_text()
+print(json.dumps({
+    "all_present": all(secrets_list),
+    "all_distinct": len(set(secrets_list)) == len(secret_names),
+    "all_safe": all(len(val) >= 24 and not val.startswith("-") and re.fullmatch(r"[A-Za-z0-9_-]+", val) for val in secrets_list),
+    "admin_policy": bool(
+        len(admin_password) >= 8
+        and re.search(r"[0-9]", admin_password)
+        and re.search(r"[a-z]", admin_password)
+        and re.search(r"[^A-Za-z0-9]", admin_password)
+    ),
+    "not_logged": not any(val and val in log_text for val in secrets_list),
+}))
+PYEOF
+assert_equal "DB·Keycloak·M2M·초기 관리자 비밀값 열 항목 모두 생성" "True" "$(json_value "$TEST_ROOT/keycloak-secret-check.json" all_present)"
+assert_equal "열 항목 비밀값을 각각 별도로 생성" "True" "$(json_value "$TEST_ROOT/keycloak-secret-check.json" all_distinct)"
+assert_equal "생성된 비밀값은 URI·환경파일에 안전" "True" "$(json_value "$TEST_ROOT/keycloak-secret-check.json" all_safe)"
+assert_equal "초기 관리자 비밀번호가 Realm 비밀번호 정책 충족" "True" "$(json_value "$TEST_ROOT/keycloak-secret-check.json" admin_policy)"
+assert_equal "Keycloak·초기 관리자 비밀값도 로그 미출력" "True" "$(json_value "$TEST_ROOT/keycloak-secret-check.json" not_logged)"
+
+ACS_ENV_FILE="$TEST_ROOT/etc/origin-env.conf" bash "$KIT_DIR/deploy.sh" --input="$TEST_ROOT/acs-v1.zip" \
+  --root="$TEST_ROOT/rb-acs-origin" --public-origin="http://192.168.60.125:13000/" --no-systemd >/dev/null 2>&1
+assert_equal "--public-origin 지정 설치 성공" "0" "$?"
+assert_true "--public-origin 끝 슬래시 제거 후 기록" grep -qx "ACS_PUBLIC_ORIGIN=http://192.168.60.125:13000" "$TEST_ROOT/rb-acs-origin/site.env"
+
+: > "$FAKE_LOG"
+assert_equal "acs restart keycloak 종료 코드" "0" "$(bash "$KIT_DIR/acs.sh" restart keycloak >/dev/null 2>&1; echo $?)"
+assert_true "acs restart keycloak 전달" grep -q "restart keycloak" "$FAKE_LOG"
+assert_equal "acs logs keycloak 종료 코드" "0" "$(bash "$KIT_DIR/acs.sh" logs keycloak >/dev/null 2>&1; echo $?)"
+assert_true "acs logs keycloak 전달" grep -q "logs -f --tail 200 keycloak" "$FAKE_LOG"
+
+assert_true "업데이트 시 Keycloak DB 백업 파일 생성" bash -c "ls '$ACS_ROOT'/backups/*/keycloak.sql.gz >/dev/null 2>&1"
+cp "$ACS_ROOT/services/state/state.amd64.bin" "$TEST_ROOT/state-before-kc-backup.bin"
+touch "$FAKE_STATE_DIR/keycloak-backup-fails"
+: > "$FAKE_LOG"
+assert_equal "Keycloak DB 백업 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v3-state.zip")"
+assert_equal "Keycloak DB 백업 실패 단계" "backup" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+assert_true "Keycloak DB 백업 실패 시 bin 변경 없음" cmp -s "$TEST_ROOT/state-before-kc-backup.bin" "$ACS_ROOT/services/state/state.amd64.bin"
+rm -f "$FAKE_STATE_DIR/keycloak-backup-fails"
+
+# Keycloak 도입 전 서버에서 첫 업그레이드할 때는 keycloak 컨테이너가 아직 없으므로 백업을 건너뛰고 설치한다.
+touch "$FAKE_STATE_DIR/no-keycloak-container"
+assert_equal "Keycloak 도입 전 서버 첫 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+rm -f "$FAKE_STATE_DIR/no-keycloak-container"
+
+# 설정 변경이 없어도 keycloak 컨테이너가 내려가 있으면 compose up -d로 복구한다.
+touch "$FAKE_STATE_DIR/keycloak-stopped"
+: > "$FAKE_LOG"
+assert_equal "중지된 keycloak 복구 업데이트 성공" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "keycloak 미실행 시 compose up 수행" grep -q "compose -p rb-acs-test .* up -d --no-build --pull never --remove-orphans" "$FAKE_LOG"
+rm -f "$FAKE_STATE_DIR/keycloak-stopped"
+
+# keycloak 컨테이너가 unhealthy면 롤백한다.
+cp "$ACS_ROOT/services/task/task.amd64.bin" "$TEST_ROOT/task-before-kc-unhealthy.bin"
+touch "$FAKE_STATE_DIR/unhealthy-keycloak"
+assert_equal "Keycloak 헬스체크 실패 종료 코드" "1" "$(run_update "$TEST_ROOT/acs-v4-task.zip")"
+assert_equal "Keycloak 헬스체크 실패 시 롤백 단계" "rollback" "$(json_value "$ACS_ROOT/deploy/status.json" stage)"
+assert_true "실패 메시지에 keycloak:unhealthy 기록" grep -q "keycloak:unhealthy" "$ACS_ROOT/deploy/status.json"
+assert_true "Keycloak 헬스체크 실패 시 이전 task bin 복원" cmp -s "$TEST_ROOT/task-before-kc-unhealthy.bin" "$ACS_ROOT/services/task/task.amd64.bin"
+rm -f "$FAKE_STATE_DIR/unhealthy-keycloak"
+
+# AUTH_ENABLED=true 환경에서 /task/execution/executions 가 401을 반환할 때 moms-webhook 토큰으로 Task 실행 수를 확인한다.
+python3 -I - "$KIT_DIR" "$TEST_ROOT" "$ACS_ROOT" <<'PYEOF'
+import json, os, subprocess, sys, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs
+
+kit_directory, test_directory, acs_root = map(Path, sys.argv[1:])
+site_settings = dict(
+    line.split("=", 1)
+    for line in (acs_root / "site.env").read_text().splitlines()
+    if line and not line.startswith("#") and "=" in line
+)
+expected_secret = site_settings.get("MOMS_WEBHOOK_CLIENT_SECRET", "expected-secret")
+issued_token = "test-m2m-jwt-secret-token"
+calls = []
+
+class AuthTaskHandler(BaseHTTPRequestHandler):
+    """401 보호된 Task API와 Keycloak client_credentials 토큰 엔드포인트를 모사합니다."""
+
+    def do_POST(self) -> None:
+        """moms-webhook client_credentials 요청을 검증하고 토큰을 발급합니다."""
+        calls.append(("POST", self.path))
+        length = int(self.headers.get("Content-Length", "0"))
+        form = parse_qs(self.rfile.read(length).decode("utf-8"))
+        if (
+            self.path.endswith("/auth/realms/rb-acs/protocol/openid-connect/token")
+            and form.get("grant_type") == ["client_credentials"]
+            and form.get("client_id") == ["moms-webhook"]
+            and form.get("client_secret") == [expected_secret]
+        ):
+            body = json.dumps({"access_token": issued_token}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(401)
+        self.end_headers()
+        self.wfile.write(b'{"error":"invalid_client"}')
+
+    def do_GET(self) -> None:
+        """Bearer 토큰이 있을 때만 Task 목록을 반환하고 없으면 401을 반환합니다."""
+        auth_header = self.headers.get("Authorization", "")
+        calls.append(("GET", self.path, bool(auth_header)))
+        if auth_header != f"Bearer {issued_token}":
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b'{"detail":"Missing bearer token"}')
+            return
+        payloads = {
+            "/idle/task/execution/executions": b"[]",
+            "/busy/task/execution/executions": b'[{"state":"running"},{"state":"completed"}]',
+        }
+        self.send_response(200 if self.path in payloads else 503)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(payloads.get(self.path, b"unavailable"))
+
+    def log_message(self, message: str, *arguments: object) -> None:
+        """시험 서버 접속 로그를 생략합니다."""
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), AuthTaskHandler)
+# 토큰 교환 경로는 Gateway 루트(/auth/...)로 들어오므로 prefix별 핸들러도 허용하도록 endswith로 처리함
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
+base_url = f"http://127.0.0.1:{server.server_port}"
+
+# 가짜 curl 대신 실제 시스템 curl 경로(있으면 /usr/bin)와 no-curl 두 경로를 모두 검증한다.
+real_path = ":".join(part for part in os.environ["PATH"].split(":") if "fake-bin" not in part)
+# docker 등은 여전히 fake-bin이 필요하므로 curl만 실제 curl로 연결한 bin 디렉터리를 만든다.
+real_curl_bin = test_directory / "real-curl-bin"
+real_curl_bin.mkdir(exist_ok=True)
+for tool_name in ("docker", "mongodump"):
+    target = test_directory / "fake-bin" / tool_name
+    link = real_curl_bin / tool_name
+    if target.exists() and not link.exists():
+        link.symlink_to(target)
+curl_env = dict(os.environ, PATH=f"{real_curl_bin}:{real_path}")
+
+no_curl_sh = test_directory / "auth-no-curl.sh"
+no_curl_sh.write_text('command() { if [ "$#" -eq 2 ] && [ "$1" = -v ] && [ "$2" = curl ]; then return 1; fi; builtin command "$@"; }\ncurl() { return 127; }\n')
+no_curl_env = dict(curl_env, BASH_ENV=str(no_curl_sh))
+
+results = {}
+try:
+    for mode_name, run_env in (("curl", curl_env), ("nocurl", no_curl_env)):
+        for state_name in ("idle", "busy"):
+            proc = subprocess.run(
+                ["bash", "-c", '. "$1/common.sh"; load_acs_env; ACS_ROOT="$2"; ACS_GATEWAY_URL="$3"; active_task_count',
+                 "_", str(kit_directory), str(acs_root), f"{base_url}/{state_name}"],
+                env=run_env, capture_output=True, text=True, timeout=15,
+            )
+            results[f"{mode_name}_{state_name}"] = proc.stdout.strip()
+
+    # 잘못된 secret일 때는 unknown을 반환해야 한다.
+    bad_root = test_directory / "bad-secret-root"
+    bad_root.mkdir(exist_ok=True)
+    (bad_root / "site.env").write_text("AUTH_ENABLED=true\nMOMS_WEBHOOK_CLIENT_SECRET=wrong-secret\n")
+    bad_proc = subprocess.run(
+        ["bash", "-c", '. "$1/common.sh"; load_acs_env; ACS_ROOT="$2"; ACS_GATEWAY_URL="$3"; active_task_count',
+         "_", str(kit_directory), str(bad_root), f"{base_url}/busy"],
+        env=curl_env, capture_output=True, text=True, timeout=15,
+    )
+    results["bad_secret"] = bad_proc.stdout.strip()
+
+    # 실제 update.sh가 AUTH_ENABLED=true + 실행 중 Task일 때 대기(75)하는지 확인한다.
+    auth_env_conf = test_directory / "auth-busy.conf"
+    auth_env_conf.write_text(f'ACS_ROOT="{acs_root}"\nACS_PROJECT="rb-acs-test"\nACS_GATEWAY_URL="{base_url}/busy"\n')
+    busy_update = subprocess.run(
+        ["bash", str(kit_directory / "update.sh"), str(test_directory / "acs-v2-task.zip")],
+        env=dict(curl_env, ACS_ENV_FILE=str(auth_env_conf)),
+        capture_output=True, text=True, timeout=30,
+    )
+    results["busy_update_exit"] = str(busy_update.returncode)
+    log_combined = (acs_root / "deploy/update.log").read_text() + busy_update.stdout + busy_update.stderr
+    results["secrets_hidden"] = str((not expected_secret or expected_secret not in log_combined) and issued_token not in log_combined)
+finally:
+    server.shutdown()
+    server.server_close()
+    server_thread.join()
+
+(test_directory / "auth-task-results.json").write_text(json.dumps(results))
+PYEOF
+assert_equal "인증 환경(curl) 유휴 Task 조회" "0" "$(json_value "$TEST_ROOT/auth-task-results.json" curl_idle)"
+assert_equal "인증 환경(curl) 실행 중 Task 집계" "1" "$(json_value "$TEST_ROOT/auth-task-results.json" curl_busy)"
+assert_equal "인증 환경(no-curl) 유휴 Task 조회" "0" "$(json_value "$TEST_ROOT/auth-task-results.json" nocurl_idle)"
+assert_equal "인증 환경(no-curl) 실행 중 Task 집계" "1" "$(json_value "$TEST_ROOT/auth-task-results.json" nocurl_busy)"
+assert_equal "인증 비밀값 불일치 시 unknown 반환" "unknown" "$(json_value "$TEST_ROOT/auth-task-results.json" bad_secret)"
+assert_equal "인증 환경에서 실행 중 Task가 있으면 update.sh 대기(75)" "75" "$(json_value "$TEST_ROOT/auth-task-results.json" busy_update_exit)"
+assert_equal "M2M 비밀값·발급 토큰은 로그 미노출" "True" "$(json_value "$TEST_ROOT/auth-task-results.json" secrets_hidden)"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

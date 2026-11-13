@@ -8,11 +8,13 @@
     validate <staging> <arch>                    매니페스트 종류·형식·arch와 모든 파일 sha256 확인
     get <staging> <key>                          매니페스트 값(version, git_commit, services, images.archive, images.tag)
     count-active                                 stdin의 Task 실행 목록에서 끝나지 않은 실행 수
+    query-active <gateway_url> [site.env]        Gateway로 실행 중 Task 수를 조회(401·403이면 M2M 토큰으로 재조회)
     write-status <file> <state> <stage> <message> <package> <version>
     write-heartbeat <file> <interval_sec>
     record <installed.json> <staging> <images_tag> <result> <message>
     installed-get <installed.json> <key>         설치 정보 값(version, images_tag)
-    make-site-env <zip> <site.env> <frs_url> <moms_url>  ZIP의 site.env.example로 site.env를 만들고 DB 비밀번호를 무작위로 채움
+    make-site-env <zip> <site.env> <frs_url> <moms_url> [public_origin]
+                                                 ZIP의 site.env.example로 site.env를 만들고 DB·Keycloak 비밀값을 무작위로 채움
     snapshot <staging> <acs_root> <installed.json> <archives_dir> <arch>  바뀔 서비스의 현재 bin·설정을 되돌리기용 릴리즈 ZIP으로 보관
     online-summary <check_dir> <installed.json> <online.json> <channel> <base_url> <auto_update> <auto_update_source>
                                                  observer가 받은 latest.json·서비스별 version.json으로 버전 탭 최신 버전 표시(online.json)
@@ -29,12 +31,15 @@ import re
 import secrets
 import signal
 import socket
+import string
 import sys
 import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 # 릴리즈 매니페스트 종류와 지원 형식 버전입니다(rb_acs scripts/deployment/build_release.py).
@@ -330,13 +335,137 @@ def get(staging_name: str, key: str) -> None:
         print(manifest.get(key) or "")
 
 
+def _parse_env_settings(site_env_path: Path) -> dict[str, str]:
+    """환경 설정 파일(`site.env`)에서 주석을 제외한 키-값 쌍을 읽습니다.
+
+    Args:
+        site_env_path (Path): 읽을 `site.env` 경로입니다.
+
+    Returns:
+        dict[str, str]: 파싱된 환경변수 사전입니다. 파일이 없으면 빈 사전입니다.
+    """
+    if not site_env_path.is_file():
+        return {}
+    try:
+        raw_lines = site_env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    parsed: dict[str, str] = {}
+    for raw_line in raw_lines:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in raw_line:
+            continue
+        key_name, value_text = raw_line.split("=", 1)
+        clean_value = value_text.strip()
+        if len(clean_value) >= 2 and clean_value[0] == clean_value[-1] and clean_value[0] in ("'", '"'):
+            clean_value = clean_value[1:-1]
+        parsed[key_name.strip()] = clean_value
+    return parsed
+
+
+def _count_active_executions(executions: object) -> int | None:
+    """파싱된 Task 실행 목록에서 종료되지 않은 실행 수를 계산합니다.
+
+    Args:
+        executions (object): JSON 응답을 파싱한 객체입니다.
+
+    Returns:
+        int | None: 실행 중 Task 개수이며, 목록 형식이 아니면 None입니다.
+    """
+    if not isinstance(executions, list):
+        return None
+    return sum(
+        1
+        for execution in executions
+        if isinstance(execution, dict) and execution.get("state") not in TERMINAL_EXECUTION_STATES
+    )
+
+
 def count_active() -> None:
     """표준 입력의 Task 실행 목록(`GET /task/execution/executions`)에서 끝나지 않은 실행 수를 출력합니다."""
     try:
         executions = json.load(sys.stdin)
     except ValueError:
         fail("Task 실행 목록을 읽지 못했습니다.")
-    print(sum(1 for execution in executions if isinstance(execution, dict) and execution.get("state") not in TERMINAL_EXECUTION_STATES))
+    active_count = _count_active_executions(executions)
+    if active_count is None:
+        fail("Task 실행 목록 형식이 올바르지 않습니다.")
+    print(active_count)
+
+
+def query_active(gateway_url: str, site_env_name: str = "") -> None:
+    """Gateway로 실행 중 Task 수를 조회하고, 경계 인증(401·403)이 켜져 있으면 M2M 토큰으로 재조회합니다.
+
+    Args:
+        gateway_url (str): 호스트에서 접속할 Gateway 주소입니다.
+        site_env_name (str): `MOMS_WEBHOOK_CLIENT_SECRET`이 든 `site.env` 경로입니다.
+    """
+    clean_gateway = gateway_url.rstrip("/")
+    executions_url = f"{clean_gateway}/task/execution/executions"
+
+    def _decode_count(raw_body: bytes) -> str:
+        try:
+            parsed_body = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return "unknown"
+        active_count = _count_active_executions(parsed_body)
+        return str(active_count) if active_count is not None else "unknown"
+
+    try:
+        with urlopen(Request(executions_url, headers={"User-Agent": "rb-acs-deploy/1"}), timeout=5) as response:
+            print(_decode_count(response.read()))
+            return
+    except HTTPError as error:
+        if error.code not in (401, 403):
+            print("unknown")
+            return
+    except (URLError, TimeoutError, OSError):
+        print("unknown")
+        return
+
+    settings = _parse_env_settings(Path(site_env_name)) if site_env_name else {}
+    auth_enabled = settings.get("AUTH_ENABLED", "true").strip().lower()
+    client_secret = settings.get("MOMS_WEBHOOK_CLIENT_SECRET", "")
+    if auth_enabled in ("0", "false", "no", "off") or not client_secret:
+        print("unknown")
+        return
+
+    realm_name = settings.get("KEYCLOAK_REALM", "rb-acs").strip() or "rb-acs"
+    token_url = f"{clean_gateway}/auth/realms/{realm_name}/protocol/openid-connect/token"
+    token_form = urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": "moms-webhook",
+            "client_secret": client_secret,
+        }
+    ).encode("utf-8")
+    token_request = Request(
+        token_url,
+        data=token_form,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "rb-acs-deploy/1",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(token_request, timeout=5) as token_response:
+            token_payload = json.loads(token_response.read().decode("utf-8"))
+        access_token = str(token_payload.get("access_token") or "")
+        if not access_token:
+            print("unknown")
+            return
+        authorized_request = Request(
+            executions_url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "User-Agent": "rb-acs-deploy/1",
+            },
+        )
+        with urlopen(authorized_request, timeout=5) as authorized_response:
+            print(_decode_count(authorized_response.read()))
+    except (HTTPError, URLError, TimeoutError, OSError, UnicodeDecodeError, ValueError):
+        print("unknown")
 
 
 def write_status(status_name: str, state: str, stage: str, message: str, package: str, version: str) -> None:
@@ -557,10 +686,46 @@ def installed_get(installed_name: str, key: str) -> None:
     print(read_json(Path(installed_name)).get(key) or "")
 
 
-def make_site_env(archive_name: str, site_env_name: str, frs_url: str, moms_url: str) -> None:
+def generate_secret() -> str:
+    """URI·환경파일(.env)에 안전하고 Keycloak 비밀번호 정책을 만족하는 무작위 비밀값을 생성합니다.
+
+    Returns:
+        str: 영문 소문자·대문자·숫자·특수문자(`_` 또는 `-`)를 모두 포함한 24자 이상 문자열입니다.
+    """
+    while True:
+        candidate = secrets.token_urlsafe(24)
+        if (
+            len(candidate) >= 24
+            and not candidate.startswith("-")
+            and any(character in string.ascii_lowercase for character in candidate)
+            and any(character in string.ascii_uppercase for character in candidate)
+            and any(character in string.digits for character in candidate)
+            and any(character in "_-" for character in candidate)
+        ):
+            return candidate
+
+
+SITE_SECRET_KEYS = (
+    "POSTGRES_PASSWORD",
+    "MONGO_INITDB_ROOT_PASSWORD",
+    "ACS_RUNTIME_PASSWORD_ENCODED",
+    "ACS_SCHEMA_PASSWORD_ENCODED",
+    "ACS_MONGO_RUNTIME_PASSWORD_ENCODED",
+    "ACS_MONGO_SCHEMA_PASSWORD_ENCODED",
+    "KC_DB_PASSWORD",
+    "KC_BOOTSTRAP_ADMIN_PASSWORD",
+    "MOMS_WEBHOOK_CLIENT_SECRET",
+    "ACS_ADMIN_PASSWORD",
+)
+
+
+def make_site_env(
+    archive_name: str, site_env_name: str, frs_url: str, moms_url: str, public_origin: str = "",
+) -> None:
     """릴리즈 ZIP의 runtime/site.env.example로 현장 site.env를 만듭니다.
 
-    PostgreSQL·MongoDB의 관리자·운영·DDL 비밀번호를 각각 URI에 안전한 무작위 값으로 만들고, FRS·MOMS 주소는 받은 값이 있으면 넣습니다.
+    DB·Keycloak·M2M·초기 관리자 비밀값을 각각 URI·환경파일에 안전한 별도 무작위 값으로 만들고,
+    FRS·MOMS·공개 출처 주소는 받은 값이 있으면 넣습니다.
     설치 후 DB 비밀번호를 바꾸면 기존 DB에 접속하지 못하므로 이 파일은 처음 한 번만 만듭니다.
 
     Args:
@@ -568,21 +733,24 @@ def make_site_env(archive_name: str, site_env_name: str, frs_url: str, moms_url:
         site_env_name (str): 만들 site.env 경로입니다.
         frs_url (str): FRS REST 주소입니다. 비면 예시 값을 둡니다.
         moms_url (str): SMC MOMS 주소입니다. 비면 예시 값을 둡니다.
+        public_origin (str): 외부 공개 Gateway 주소(`ACS_PUBLIC_ORIGIN`)입니다. 비면 예시 값을 둡니다.
     """
     with zipfile.ZipFile(archive_name) as release_archive:
         example_lines = release_archive.read("runtime/site.env.example").decode("utf-8").splitlines()
-    replacements = {
-        "POSTGRES_PASSWORD": secrets.token_urlsafe(24),
-        "MONGO_INITDB_ROOT_PASSWORD": secrets.token_urlsafe(24),
-        "ACS_RUNTIME_PASSWORD_ENCODED": secrets.token_urlsafe(24),
-        "ACS_SCHEMA_PASSWORD_ENCODED": secrets.token_urlsafe(24),
-        "ACS_MONGO_RUNTIME_PASSWORD_ENCODED": secrets.token_urlsafe(24),
-        "ACS_MONGO_SCHEMA_PASSWORD_ENCODED": secrets.token_urlsafe(24),
-    }
+    used_secrets: set[str] = set()
+    replacements: dict[str, str] = {}
+    for secret_key in SITE_SECRET_KEYS:
+        generated = generate_secret()
+        while generated in used_secrets:
+            generated = generate_secret()
+        used_secrets.add(generated)
+        replacements[secret_key] = generated
     if frs_url:
         replacements["FRS_API_BASE_URL"] = frs_url
     if moms_url:
         replacements["SMC_MOMS_URL"] = moms_url
+    if public_origin.strip():
+        replacements["ACS_PUBLIC_ORIGIN"] = public_origin.strip().rstrip("/")
     site_lines = []
     for example_line in example_lines:
         key_name = example_line.split("=", 1)[0].strip()
@@ -828,6 +996,8 @@ def main(arguments: list[str]) -> None:
         get(*command_arguments)
     elif command_name == "count-active" and not command_arguments:
         count_active()
+    elif command_name == "query-active" and len(command_arguments) in (1, 2):
+        query_active(*command_arguments)
     elif command_name == "write-status" and len(command_arguments) == 6:
         write_status(*command_arguments)
     elif command_name == "write-heartbeat" and len(command_arguments) == 2:
@@ -844,7 +1014,7 @@ def main(arguments: list[str]) -> None:
         prune_archives(*command_arguments)
     elif command_name == "installed-get" and len(command_arguments) == 2:
         installed_get(*command_arguments)
-    elif command_name == "make-site-env" and len(command_arguments) == 4:
+    elif command_name == "make-site-env" and len(command_arguments) in (4, 5):
         make_site_env(*command_arguments)
     elif command_name == "snapshot" and len(command_arguments) == 5:
         snapshot(*command_arguments)

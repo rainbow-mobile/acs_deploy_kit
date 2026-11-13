@@ -6,7 +6,7 @@
 #   --mode=<채널>            온라인 배포 채널 (기본: main, develop이면 개발 빌드. URL은 .../acs/<채널>)
 #   --input=<파일>           오프라인 설치에 쓸 통합 ZIP. 주면 온라인으로 받지 않는다
 #   --reinstall              이미 설치된 버전이 온라인 최신과 같거나 높아도 다시 받아 설치한다
-#   --reinstall              이미 설치된 버전이 온라인 최신과 같거나 높아도 다시 받아 설치한다
+#   --public-origin=<주소>   site.env를 새로 만들 때 넣을 외부 공개 주소(예: http://192.168.60.125:13000)
 #
 #   --root=<디렉터리>        설치 디렉터리 (기본: 배포 키트 옆 rb-acs, 예: ~/rb-acs)
 #   --project=<이름>         compose 프로젝트 이름 (기본: rb-acs)
@@ -48,6 +48,7 @@ SITE_ENV_SOURCE=""
 SITE_COMPOSE_SOURCE=""
 FRS_URL=""
 MOMS_URL=""
+PUBLIC_ORIGIN=""
 REGISTER_SYSTEMD=1
 OBSERVER_SERVICE_NAME="acs-update-observer"
 
@@ -71,6 +72,7 @@ while [ $# -gt 0 ]; do
     --site-compose=*) SITE_COMPOSE_SOURCE="${1#*=}" ;;
     --frs-url=*) FRS_URL="${1#*=}" ;;
     --moms-url=*) MOMS_URL="${1#*=}" ;;
+    --public-origin=*) PUBLIC_ORIGIN="${1#*=}" ;;
     --no-systemd) REGISTER_SYSTEMD=0 ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "❌ 알 수 없는 옵션: $1" >&2; usage; exit 2 ;;
@@ -294,8 +296,8 @@ if [ -n "$SITE_ENV_SOURCE" ]; then
   install -m 600 "$SITE_ENV_SOURCE" "$ACS_ROOT/site.env"
   echo "📝 site.env 복사: $SITE_ENV_SOURCE"
 elif [ ! -f "$ACS_ROOT/site.env" ]; then
-  release_tool make-site-env "$PACKAGE_PATH" "$ACS_ROOT/site.env" "$FRS_URL" "$MOMS_URL"
-  echo "📝 site.env를 만들었습니다(DB 비밀번호는 무작위). FRS·MOMS 주소를 확인하세요: $ACS_ROOT/site.env"
+  release_tool make-site-env "$PACKAGE_PATH" "$ACS_ROOT/site.env" "$FRS_URL" "$MOMS_URL" "$PUBLIC_ORIGIN"
+  echo "site.env를 만들었습니다(DB·Keycloak·초기 관리자 비밀값 자동 생성). 공개 출처(ACS_PUBLIC_ORIGIN)와 FRS·MOMS 주소를 확인하세요: $ACS_ROOT/site.env"
 else
   echo "📝 기존 site.env를 그대로 씁니다."
 fi

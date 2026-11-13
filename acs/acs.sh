@@ -9,7 +9,7 @@
 #   version              설치된 전체·서비스별 버전
 #   observer [status|restart|logs]  업데이트 감시(systemd acs-update-observer)
 #   --force              업데이트 중이어도 start·stop·restart를 한다(업데이트 엔진의 헬스체크·되돌리기와 겹칠 수 있음)
-# 서비스: common scenario task state external map mock api-gateway zenoh-router mongo postgres
+# 서비스: common scenario task state external map mock api-gateway zenoh-router keycloak mongo postgres
 # 종료 코드: 0 성공, 2 사용법 오류, 75 업데이트 중이라 거절, 그 밖은 docker compose 종료 코드.
 # compose 파일·env 파일·프로젝트 이름은 업데이트 엔진과 같은 common.sh acs_compose를 쓴다.
 
@@ -25,7 +25,7 @@ load_acs_env
 LOG_TAIL_LINES=200
 OBSERVER_SERVICE_NAME="acs-update-observer"
 # 이름으로 고를 수 있는 compose 서비스입니다(ACS 서비스 + 인프라).
-CONTROL_SERVICES=("${ACS_SERVICES[@]}" api-gateway zenoh-router mongo postgres)
+CONTROL_SERVICES=("${ACS_SERVICES[@]}" api-gateway zenoh-router keycloak mongo postgres)
 
 print_usage() {
   sed -n '2,14p' "$SCRIPT_DIR/acs.sh" | sed 's/^# \{0,1\}//'

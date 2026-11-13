@@ -37,7 +37,7 @@ systemd 서비스 내용은 `deploy.sh`가 설치할 때 바로 생성합니다.
 ## 최초 설치
 
 온라인 설치가 기본입니다(2026-11-03). `--mode`로 채널을 고르고, 오프라인 설치만 `--input`으로 ZIP을 지정합니다.
-`site.env`가 없는 최초 설치에서는 ZIP의 예시 파일에 있는 비밀번호 여섯 개를 각각 별도 무작위 값으로 채웁니다. 관리자는 `POSTGRES_PASSWORD`·`MONGO_INITDB_ROOT_PASSWORD`, PostgreSQL 운영·스키마는 `ACS_RUNTIME_PASSWORD_ENCODED`·`ACS_SCHEMA_PASSWORD_ENCODED`, MongoDB 운영·스키마는 `ACS_MONGO_RUNTIME_PASSWORD_ENCODED`·`ACS_MONGO_SCHEMA_PASSWORD_ENCODED`를 사용합니다. 값은 URI에 안전한 문자로 생성하고 기존 `${...}` 참조는 유지합니다. 생성 파일 권한은 `0600`이며, 기존 공통 비밀번호를 사용하는 `site.env`와 `--site-env` 지정 설정도 재생성하지 않습니다.
+`site.env`가 없는 최초 설치에서는 ZIP의 예시 파일에 있는 DB·Keycloak·M2M·초기 관리자 비밀값 열 개를 각각 별도 무작위 값으로 채웁니다. 관리자는 `POSTGRES_PASSWORD`·`MONGO_INITDB_ROOT_PASSWORD`, PostgreSQL 운영·스키마는 `ACS_RUNTIME_PASSWORD_ENCODED`·`ACS_SCHEMA_PASSWORD_ENCODED`, MongoDB 운영·스키마는 `ACS_MONGO_RUNTIME_PASSWORD_ENCODED`·`ACS_MONGO_SCHEMA_PASSWORD_ENCODED`, Keycloak·경계 인증은 `KC_DB_PASSWORD`·`KC_BOOTSTRAP_ADMIN_PASSWORD`·`MOMS_WEBHOOK_CLIENT_SECRET`·`ACS_ADMIN_PASSWORD`를 사용합니다. 값은 URI·환경파일에 안전하고 Realm 비밀번호 정책(영문·숫자·특수문자 포함)을 충족하는 문자로 생성하며 기존 `${...}` 참조는 유지합니다. `--public-origin`을 주면 `ACS_PUBLIC_ORIGIN`(끝 슬래시 제거)도 함께 기록합니다. 생성 파일 권한은 `0600`이며, 기존 `site.env`와 `--site-env` 지정 설정은 재생성하지 않습니다.
 
 ```bash
 ./deploy.sh                                  # 온라인 main 채널 최신 통합 ZIP으로 설치
@@ -57,6 +57,7 @@ systemd 서비스 내용은 `deploy.sh`가 설치할 때 바로 생성합니다.
 | `--project=<이름>` | `rb-acs` | compose 프로젝트 이름 |
 | `--gateway-url=<주소>` | `http://127.0.0.1:13000` | 실행 중 Task 확인 주소 |
 | `--site-env=<파일>` | 없음 | 기존 현장 설정 복사 |
+| `--public-origin=<주소>` | 예시 파일 값 | `site.env` 신규 생성 시 외부 공개 Gateway 주소(`ACS_PUBLIC_ORIGIN`) 기록 |
 | `--site-compose=<파일>` | 없음 | 현장 compose 덮어쓰기 |
 | `--online-url=<주소>` | `https://diokjo4dtg1mp.cloudfront.net/acs/<채널>` | 별도 배포 URL을 사용할 때 덮어쓰기 |
 | `--auto-update` | 사용 안 함 | 온라인 최신 버전 자동 적용 활성화 |
@@ -115,9 +116,10 @@ observer 자동 업데이트와 `update.sh --online`도 같은 채널을 봅니�
   매니페스트 version에 빌드 때 최신 통합 버전이 들어 있어도 서비스별 버전만 바꿉니다. 그래서 서비스 하나만 올린 뒤에도 새 통합 버전으로 업데이트할 수 있습니다.
   `bundle`이 없는 예전 ZIP은 설치된 서비스를 모두 담았을 때만 통합으로 봅니다. 되돌리기 보관본도 어느 쪽을 적용하기 전인지 `bundle`로 남깁니다.
 - DB 백업은 `backups/`에 최근 3개를 유지합니다. DB 자체는 자동 롤백하지 않습니다.
-- MongoDB 백업은 기존 `site.env`에서 컨테이너로 전달된 `MONGO_INITDB_ROOT_USERNAME`·`MONGO_INITDB_ROOT_PASSWORD`로 `admin` DB에 인증합니다. 백업에 실패하면 설정·서비스 bin을 교체하기 전에 중단합니다.
+- MongoDB 백업은 기존 `site.env`에서 컨테이너로 전달된 `MONGO_INITDB_ROOT_USERNAME`·`MONGO_INITDB_ROOT_PASSWORD`로 `admin` DB에 인증합니다. PostgreSQL 백업은 `state` DB(`postgres.sql.gz`)와 함께 `keycloak` 컨테이너가 구성된 환경의 `keycloak` DB(`keycloak.sql.gz`)도 덤프하며, 어느 하나라도 실패하면 설정·서비스 bin을 교체하기 전에 중단합니다.
+- 재시작·헬스체크 단계는 ACS 서비스와 함께 `keycloak` 컨테이너의 실행·healthy 상태도 확인합니다. Realm 설정(`infrastructure/keycloak/*`)이 바뀌면 `keycloak`도 재시작하고, `keycloak`이 내려가 있으면 다시 기동하며, 헬스체크에 실패하면 직전 버전으로 롤백합니다.
 - 서비스 준비 후 Gateway 설정을 검사하고 reload하여 바뀐 컨테이너 주소를 다시 조회합니다. 이후 추가 API 응답 검사 없이 성공으로 기록하며, 기존 서비스 healthcheck와 Gateway 설정 검사·reload의 실패는 기존 복구 처리를 실행합니다.
-- 업데이트 전 Task 실행 확인은 `curl`이 없어도 기존 다운로드 대체 경로의 Python 3 표준 라이브러리로 수행합니다. 별도 패키지를 설치하지 않으며 HTTP 오류나 잘못된 JSON은 기존처럼 응답 실패로 처리합니다.
+- 업데이트 전 Task 실행 확인은 `AUTH_ENABLED=true`로 `/task/execution/executions`가 `401`·`403`을 반환하면 `site.env`의 `MOMS_WEBHOOK_CLIENT_SECRET`(`moms-webhook` client_credentials)으로 내부 토큰을 발급받아 재조회합니다. `curl`이 없어도 Python 3 표준 라이브러리로 동일하게 동작하며, 비밀값과 발급 토큰은 명령줄이나 로그에 출력하지 않습니다.
 - 자동 복구 가능한 검사는 빌드 단계에서 먼저 고칩니다. 손상된 ZIP처럼 고칠 수 없는 오류는 기존 설치를 보존한 채 실패 처리합니다.
 
 ```bash
@@ -141,7 +143,7 @@ compose 파일·env 파일·프로젝트 이름은 업데이트 엔진과 같은
 acs                       # 상태: 설치 버전·업데이트 상태·observer·compose ps
 acs restart task state    # 일부 재시작 (서비스를 안 주면 전체)
 acs start | acs stop      # 전체 실행(up -d)·중지
-acs logs task             # 마지막 200줄부터 따라가며 보기
+acs logs task             # 마지막 200줄부터 따라가며 보기 (keycloak·api-gateway 등 인프라 포함)
 acs version               # 전체·서비스별 설치 버전
 acs observer restart      # 업데이트 감시 재시작 (status·logs도 됨)
 ```

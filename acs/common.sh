@@ -205,25 +205,23 @@ wait_services_healthy() {  # <timeout_sec> <service...>
   done
 }
 
-# 끝나지 않은 Task 실행 수. Task 서비스가 응답하지 않으면 unknown(설치 전·서비스가 내려가 있음)을 출력한다.
+# 끝나지 않은 Task 실행 수. 경계 인증(401·403)이 켜져 있으면 M2M 토큰으로 재조회하고, 응답하지 않으면 unknown을 출력한다.
 active_task_count() {
-  local executions_json temporary_directory
+  local executions_output curl_status=0
   if ! command -v curl >/dev/null 2>&1; then
-    temporary_directory="$(mktemp -d)" || { echo "unknown"; return; }
-    if download_file "$ACS_GATEWAY_URL/task/execution/executions" "$temporary_directory/executions.json" 5 2>/dev/null; then
-      release_tool count-active < "$temporary_directory/executions.json" 2>/dev/null || echo "unknown"
-    else
-      echo "unknown"
-    fi
-    rm -f "$temporary_directory/executions.json" "$temporary_directory/.executions.json.part"
-    rmdir "$temporary_directory"
+    release_tool query-active "$ACS_GATEWAY_URL" "$ACS_ROOT/site.env" 2>/dev/null || echo "unknown"
     return
   fi
-  if executions_json="$(curl -fsS --max-time 5 "$ACS_GATEWAY_URL/task/execution/executions" 2>/dev/null)"; then
-    printf '%s' "$executions_json" | release_tool count-active 2>/dev/null || echo "unknown"
-  else
-    echo "unknown"
+  executions_output="$(curl -fsS --max-time 5 "$ACS_GATEWAY_URL/task/execution/executions" 2>&1)" || curl_status=$?
+  if [ "$curl_status" -eq 0 ]; then
+    printf '%s' "$executions_output" | release_tool count-active 2>/dev/null || echo "unknown"
+    return
   fi
+  if [ "$curl_status" -eq 22 ] && [[ "$executions_output" == *" 401"* || "$executions_output" == *" 403"* ]]; then
+    release_tool query-active "$ACS_GATEWAY_URL" "$ACS_ROOT/site.env" 2>/dev/null || echo "unknown"
+    return
+  fi
+  echo "unknown"
 }
 
 waiting_message() {  # <active_count>
