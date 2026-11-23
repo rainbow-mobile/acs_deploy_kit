@@ -39,13 +39,13 @@ if [ "${1:-}" = "compose" ]; then
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
     *" ps --services --status running "*)
       if [ -f "$FAKE_STATE_DIR/containers-created" ]; then
-        printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres
+        printf '%s\n' common scenario task state external map mock multi api-gateway zenoh-router mongo postgres
         [ -f "$FAKE_STATE_DIR/keycloak-stopped" ] || [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] || echo keycloak
       fi
       exit 0 ;;
     *" ps -a --services "*)
       if [ -f "$FAKE_STATE_DIR/containers-created" ]; then
-        printf '%s\n' common scenario task state external map mock api-gateway zenoh-router mongo postgres
+        printf '%s\n' common scenario task state external map mock multi api-gateway zenoh-router mongo postgres
         [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] || echo keycloak
       fi
       exit 0 ;;
@@ -254,7 +254,7 @@ run_update() {  # update.sh 종료 코드를 돌려준다(출력은 숨김).
   echo $?
 }
 
-ALL_SERVICES="common,scenario,task,state,external,map,mock"
+ALL_SERVICES="common,scenario,task,state,external,map,mock,multi"
 make_release "$TEST_ROOT/acs-v1.zip" v1 "$ALL_SERVICES" v1
 # 부분 ZIP이지만 통합 버전 기록·보관본 이름을 보려고 통합 묶음으로 표시한다.
 RELEASE_BUNDLE=total make_release "$TEST_ROOT/acs-v2-task.zip" v2 task - "listen 13199;\n"
@@ -273,6 +273,8 @@ assert_equal "이미지 태그" "v1" "$(json_value "$ACS_ROOT/deploy/installed.j
 assert_equal "상태" "success" "$(json_value "$ACS_ROOT/deploy/status.json" state)"
 assert_true ".env에 이미지 태그" grep -qx "ACS_IMAGE_TAG=v1" "$ACS_ROOT/.env"
 assert_true "task bin 실행 권한" test -x "$ACS_ROOT/services/task/task.amd64.bin"
+# multi도 다른 서비스처럼 bin으로 설치한다(2026-11-23).
+assert_true "multi bin 실행 권한" test -x "$ACS_ROOT/services/multi/multi.amd64.bin"
 assert_true "이미지 load" grep -q "docker load -i" "$FAKE_LOG"
 assert_true "최초 설치는 DB 백업을 하지 않음" bash -c "! grep -q mongodump '$FAKE_LOG'"
 assert_true "최초 설치는 compose up이 만든 컨테이너를 다시 재시작하지 않음" bash -c "! grep -q ' restart ' '$FAKE_LOG'"
@@ -324,6 +326,9 @@ bash "$KIT_DIR/acs.sh" start >/dev/null 2>&1
 assert_true "start는 up -d" grep -q "compose .* up -d" "$FAKE_LOG"
 bash "$KIT_DIR/acs.sh" stop mock >/dev/null 2>&1
 assert_true "stop은 지정 서비스만" grep -q "compose .* stop mock" "$FAKE_LOG"
+# multi도 ACS 서비스라 acs 명령으로 재시작한다(2026-11-23).
+bash "$KIT_DIR/acs.sh" restart multi >/dev/null 2>&1
+assert_true "restart multi도 지정 서비스만" grep -q "compose .* restart multi" "$FAKE_LOG"
 bash "$KIT_DIR/acs.sh" logs task >/dev/null 2>&1
 assert_true "logs는 따라가며 마지막 줄부터" grep -q "compose .* logs -f --tail 200 task" "$FAKE_LOG"
 acs_status_output="$(bash "$KIT_DIR/acs.sh" 2>&1)"
