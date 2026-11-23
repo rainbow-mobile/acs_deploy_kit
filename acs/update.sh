@@ -369,6 +369,12 @@ while IFS= read -r relative_path; do
 done < <(cd "$STAGING_DIR/runtime" && find . -type f -printf '%P\n' | sort)
 log "바뀐 설정 파일: ${changed_runtime_paths[*]:-없음}"
 
+# 릴리즈 밖의 HTTPS/WSS 활성화 상태를 Gateway가 시작하기 전에 복원합니다.
+if [ -f "$ACS_ROOT/tls.sh" ]; then
+  ACS_PROJECT="$ACS_PROJECT" bash "$ACS_ROOT/tls.sh" apply "$ACS_ROOT/site.env" \
+    || fail_with_rollback "Gateway TLS 설정 적용에 실패했습니다"
+fi
+
 # ── swap ─────────────────────────────────────────
 CURRENT_STAGE="swap"
 write_status running swap "서비스 bin을 바꾸는 중: ${UPDATED_SERVICES[*]}"
