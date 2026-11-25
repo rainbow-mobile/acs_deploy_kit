@@ -31,6 +31,7 @@ import re
 import secrets
 import signal
 import socket
+import ssl
 import string
 import sys
 import tempfile
@@ -400,7 +401,21 @@ def query_active(gateway_url: str, site_env_name: str = "") -> None:
         gateway_url (str): 호스트에서 접속할 Gateway 주소입니다.
         site_env_name (str): `MOMS_WEBHOOK_CLIENT_SECRET`이 든 `site.env` 경로입니다.
     """
+    settings = _parse_env_settings(Path(site_env_name)) if site_env_name else {}
+    if settings.get("HTTPS_ENABLED", "false").strip().lower() == "true" and gateway_url.startswith("http://"):
+        gateway_url = settings.get("ACS_PUBLIC_ORIGIN", "").strip()
+        if not gateway_url.startswith("https://"):
+            print("unknown")
+            return
     clean_gateway = gateway_url.rstrip("/")
+    tls_context = None
+    if clean_gateway.startswith("https://"):
+        ca_path = settings.get("TLS_CA_PATH", "").strip() or settings.get("TLS_CERT_PATH", "").strip()
+        try:
+            tls_context = ssl.create_default_context(cafile=ca_path or None)
+        except (OSError, ssl.SSLError):
+            print("unknown")
+            return
     executions_url = f"{clean_gateway}/task/execution/executions"
 
     def _decode_count(raw_body: bytes) -> str:
@@ -412,7 +427,8 @@ def query_active(gateway_url: str, site_env_name: str = "") -> None:
         return str(active_count) if active_count is not None else "unknown"
 
     try:
-        with urlopen(Request(executions_url, headers={"User-Agent": "rb-acs-deploy/1"}), timeout=5) as response:
+        with urlopen(Request(executions_url, headers={"User-Agent": "rb-acs-deploy/1"}), timeout=5,
+                     context=tls_context) as response:
             print(_decode_count(response.read()))
             return
     except HTTPError as error:
@@ -423,7 +439,6 @@ def query_active(gateway_url: str, site_env_name: str = "") -> None:
         print("unknown")
         return
 
-    settings = _parse_env_settings(Path(site_env_name)) if site_env_name else {}
     auth_enabled = settings.get("AUTH_ENABLED", "true").strip().lower()
     client_secret = settings.get("MOMS_WEBHOOK_CLIENT_SECRET", "")
     if auth_enabled in ("0", "false", "no", "off") or not client_secret:
@@ -449,7 +464,7 @@ def query_active(gateway_url: str, site_env_name: str = "") -> None:
         method="POST",
     )
     try:
-        with urlopen(token_request, timeout=5) as token_response:
+        with urlopen(token_request, timeout=5, context=tls_context) as token_response:
             token_payload = json.loads(token_response.read().decode("utf-8"))
         access_token = str(token_payload.get("access_token") or "")
         if not access_token:
@@ -462,7 +477,7 @@ def query_active(gateway_url: str, site_env_name: str = "") -> None:
                 "User-Agent": "rb-acs-deploy/1",
             },
         )
-        with urlopen(authorized_request, timeout=5) as authorized_response:
+        with urlopen(authorized_request, timeout=5, context=tls_context) as authorized_response:
             print(_decode_count(authorized_response.read()))
     except (HTTPError, URLError, TimeoutError, OSError, UnicodeDecodeError, ValueError):
         print("unknown")

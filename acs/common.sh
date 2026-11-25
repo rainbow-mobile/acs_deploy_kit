@@ -209,6 +209,11 @@ wait_services_healthy() {  # <timeout_sec> <service...>
 # 끝나지 않은 Task 실행 수. 경계 인증(401·403)이 켜져 있으면 M2M 토큰으로 재조회하고, 응답하지 않으면 unknown을 출력한다.
 active_task_count() {
   local executions_output curl_status=0
+  # HTTPS 전환 현장에서는 공개 SAN과 현장 CA로 인증서를 검증하는 Python 조회를 사용합니다.
+  if [ -f "$ACS_ROOT/site.env" ] && grep -q '^HTTPS_ENABLED=true$' "$ACS_ROOT/site.env"; then
+    release_tool query-active "$ACS_GATEWAY_URL" "$ACS_ROOT/site.env" 2>/dev/null || echo "unknown"
+    return
+  fi
   if ! command -v curl >/dev/null 2>&1; then
     release_tool query-active "$ACS_GATEWAY_URL" "$ACS_ROOT/site.env" 2>/dev/null || echo "unknown"
     return
