@@ -121,6 +121,8 @@ observer 자동 업데이트와 `update.sh --online`도 같은 채널을 봅니�
 - 서비스 준비 후 Gateway 설정을 검사하고 reload하여 바뀐 컨테이너 주소를 다시 조회합니다. 이후 추가 API 응답 검사 없이 성공으로 기록하며, 기존 서비스 healthcheck와 Gateway 설정 검사·reload의 실패는 기존 복구 처리를 실행합니다.
 - ACS 릴리즈에 `runtime/tls.sh`가 있으면 설치·업데이트에서 runtime 파일을 복사한 다음 현장 `site.env`의 HTTPS/WSS 활성 상태를 Gateway 기동 전에 적용합니다. 기존 Gateway `13000`과 사용 중인 외부 플랫폼 포트(현재 `13100`)가 같은 포트에서 HTTP/WS 또는 HTTPS/WSS로 전환됩니다. 인증서와 개인키는 릴리즈 밖의 `TLS_STORAGE_DIR`에 두고 `site.env`도 보존합니다. TLS 적용이 실패하면 업데이트를 중단하고 이전 runtime·서비스 파일로 되돌립니다. 구버전 릴리즈에 `tls.sh`가 없으면 기존 동작을 유지합니다.
 - HTTPS 현장은 업데이트 전 Task 조회에 `site.env`의 `ACS_PUBLIC_ORIGIN`을 사용합니다. 자체 서명 인증서는 `TLS_CERT_PATH`, 사설 CA 인증서는 `TLS_CA_PATH`를 신뢰 기준으로 사용하며 인증서 검증을 우회하지 않습니다. `ACS_PUBLIC_ORIGIN`은 인증서 SAN과 일치하고 배포 호스트에서 접속 가능해야 합니다. 인증서나 공개 주소가 잘못되어 조회에 실패하면 기존 정책대로 실행 수를 `unknown`으로 기록합니다.
+
+다른 PC에 처음 설치할 때는 인증서·개인키가 릴리즈 ZIP이나 배포 키트에 포함되지 않으므로 대상 PC에 별도로 준비합니다. `--site-env=<파일>`로 기존 현장 설정을 가져오거나 대상 PC에서 만든 `site.env`에 `HTTPS_ENABLED=true`와 그 PC의 절대 경로 `TLS_STORAGE_DIR`, `TLS_CERT_PATH`, `TLS_KEY_PATH`를 지정합니다. 사설 CA를 사용하면 업데이트 전 Task 조회용 공개 CA 파일 경로를 `TLS_CA_PATH`에 지정합니다. `TLS_STORAGE_DIR`은 Gateway에 읽기 전용으로 통째로 마운트되므로 CA 개인키 등 다른 비밀은 보관하지 않습니다. 공개 접속 주소 `ACS_PUBLIC_ORIGIN`은 대상 PC에서 연결 가능하고 인증서 SAN과 일치해야 합니다. 개발 PC의 `localhost` 전용 인증서는 다른 PC의 IP 접속에 그대로 사용할 수 없습니다. 인증서나 경로가 없는데 HTTPS를 켜면 설치·업데이트의 TLS 적용 단계가 실패합니다. 같은 PC의 후속 업데이트는 기존 `site.env`와 릴리즈 밖 인증서를 유지합니다.
 - 업데이트 전 Task 실행 확인은 `AUTH_ENABLED=true`로 `/task/execution/executions`가 `401`·`403`을 반환하면 `site.env`의 `MOMS_WEBHOOK_CLIENT_SECRET`(`moms-webhook` client_credentials)으로 내부 토큰을 발급받아 재조회합니다. `curl`이 없어도 Python 3 표준 라이브러리로 동일하게 동작하며, 비밀값과 발급 토큰은 명령줄이나 로그에 출력하지 않습니다.
 - 자동 복구 가능한 검사는 빌드 단계에서 먼저 고칩니다. 손상된 ZIP처럼 고칠 수 없는 오류는 기존 설치를 보존한 채 실패 처리합니다.
 
