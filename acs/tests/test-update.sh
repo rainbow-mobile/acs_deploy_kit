@@ -230,6 +230,9 @@ runtime_files = {
     "tls.sh": (
         b"#!/bin/bash\n"
         b"echo \"tls $1 $2 $ACS_PROJECT\" >> \"$FAKE_LOG\"\n"
+        b"echo \"tls-prestart ${TLS_PRESTART_ONLY:-false}\" >> \"$FAKE_LOG\"\n"
+        b"echo \"tls-compose-mode ${TLS_COMPOSE_MODE:-offline}\" >> \"$FAKE_LOG\"\n"
+        b"[ ! -f \"$FAKE_STATE_DIR/old-gateway-config-incompatible\" ] || [ \"${TLS_COMPOSE_MODE:-offline}\" = dev ] || exit 1\n"
         b"[ ! -f \"$FAKE_STATE_DIR/tls-apply-fails\" ]\n"
     ),
     "site.env.example": (
@@ -402,15 +405,20 @@ echo "listen 13105; # 현장 수정" > "$ACS_ROOT/api-gateway/servers/smc.conf"
 echo '# 현장 관측 포트·볼륨 유지' >> "$ACS_ROOT/infrastructure/observability/compose.yml"
 cp "$ACS_ROOT/infrastructure/observability/compose.yml" "$TEST_ROOT/observability-before-update.yml"
 : > "$FAKE_LOG"
+touch "$FAKE_STATE_DIR/old-gateway-config-incompatible"
 assert_equal "v2(task) 적용 종료 코드" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+rm -f "$FAKE_STATE_DIR/old-gateway-config-incompatible"
 assert_true "부분 업데이트에서 현장 TLS 설정 적용" grep -Fqx "tls apply $ACS_ROOT/site.env rb-acs-test" "$FAKE_LOG"
+assert_true "업데이트 사전 TLS 적용은 옛 Gateway 검사를 건너뜀" grep -Fqx "tls-prestart true" "$FAKE_LOG"
+assert_true "구버전 TLS 스크립트도 옛 Gateway 검사를 건너뜀" grep -Fqx "tls-compose-mode dev" "$FAKE_LOG"
 assert_true "TLS 설정을 컨테이너 기동 전에 적용" python3 -I - "$FAKE_LOG" <<'PYEOF'
 import sys
 from pathlib import Path
 commands = Path(sys.argv[1]).read_text().splitlines()
 tls_position = next(index for index, command in enumerate(commands) if command.startswith("tls apply "))
 startup_position = next(index for index, command in enumerate(commands) if " up -d " in command)
-raise SystemExit(0 if tls_position < startup_position else 1)
+gateway_check_position = next(index for index, command in enumerate(commands) if "exec -T api-gateway nginx -t" in command)
+raise SystemExit(0 if tls_position < startup_position < gateway_check_position else 1)
 PYEOF
 assert_true "task bin은 v2" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "state bin은 v1 그대로" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
