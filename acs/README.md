@@ -189,6 +189,20 @@ acs observer restart      # 업데이트 감시 재시작 (status·logs도 됨)
 - rb_acs에 상시 인프라를 추가할 때는 `restart: unless-stopped`를 붙여야 키트가 멈춘 컨테이너를 알아봅니다. ACS 서비스는 지금처럼 `/app/service/<이름>.<arch>.bin`을 실행합니다.
 - 현장의 `services/multi/` 폴더는 남지만 쓰지 않습니다. Internal DB 주소는 `site.env`의 `INTERNAL_MONGO_URI`(없으면 `SM_MONGO_URI`)이고 DB 이름은 기존 이력을 쓰려고 `multi`를 유지합니다.
 
+## Gateway 남은 설정 옮기기 (2026-11-26)
+
+업데이트는 릴리즈에 있는 설정을 놓거나 덮어쓰기만 합니다. 서비스 이름이 바뀌거나 없어지면 옛 Gateway 경로 파일이 남는데,
+nginx가 폴더째 읽는 `api-gateway/locations/*.conf`·`api-gateway/subsystems/*.conf`에 남으면 없는 upstream을 가리켜
+Gateway 검사(`nginx -t`)가 실패하고 업데이트가 되돌아갑니다(예: multi → internal 뒤 남은 `locations/multi.conf`).
+
+- 적용할 ZIP에 그 폴더가 있으면, 서버에는 있는데 ZIP에는 없는 그 폴더 바로 아래 `.conf`를 **지우지 않고** `.rollback/runtime/`으로 옮기고
+  `update.log`에 "옮긴 설정 파일"로 남깁니다. 그 폴더가 없는 예전 형식 ZIP은 아무것도 옮기지 않습니다.
+- 업데이트가 실패하면 자동 되돌리기가 옮긴 파일을 그대로 되살립니다.
+- 업데이트 직전 보관본(`deploy/archives/`)에 두 폴더의 `.conf`를 통째로 담아, 버전 탭에서 되돌리면 옮긴 파일이 돌아오고 보관본에 없는 새 파일은 같은 규칙으로 옮겨집니다.
+  예전 릴리즈 ZIP을 다시 올려 내릴 때도 같습니다. 이 키트 전에 만든 보관본으로 되돌리면 옮긴 파일은 돌아오지 않지만 Gateway는 정상 기동합니다(그 경로만 404).
+- 새 서비스만 든 ZIP처럼 바뀌는 서비스가 아직 설치되지 않았어도, 설치된 서버라면 설정 파일만 든 보관본을 만듭니다(처음 설치만 건너뜀).
+- 두 폴더의 `.conf`가 아닌 파일, 하위 폴더, `api-gateway/servers/`(현장 파일)는 건드리지 않습니다. 현장 Gateway 파일은 `servers/`에 둡니다.
+
 ## 테스트
 
 ```bash

@@ -254,6 +254,9 @@ runtime_files = {
     "infrastructure/observability/loki/loki.yaml": f"# {version}\nlimits_config:\n  retention_period: 720h\n".encode(),
     "infrastructure/observability/alloy/config.alloy": b"// existing Alloy\n",
 }
+# Gateway 서비스 경로 파일(RELEASE_LOCATIONS, 쉼표 구분). 없으면 예전 시험 릴리즈처럼 locations 폴더를 담지 않습니다.
+for location_name in filter(None, (os.environ.get("RELEASE_LOCATIONS") or "").split(",")):
+    runtime_files[f"api-gateway/locations/{location_name}.conf"] = f"# {location_name} {version}\n".encode()
 for relative_path, content in runtime_files.items():
     entries[f"runtime/{relative_path}"] = content
 images = {"tag": None, "names": [], "archive": None, "sha256": None}
@@ -1219,6 +1222,60 @@ assert_equal "compose 목록을 못 읽으면 업데이트 중단" "1" "$(auto_u
 rm -f "$FAKE_STATE_DIR/compose-config-fails"
 assert_true "목록을 못 읽은 업데이트는 bin을 바꾸지 않음" cmp -s "$TEST_ROOT/auto-task-before-config-fail.bin" "$AUTO_ROOT/services/task/task.amd64.bin"
 assert_true "목록을 못 읽은 이유를 상태에 기록" grep -q "ACS 서비스를 찾지 못했습니다" "$AUTO_ROOT/deploy/status.json"
+
+echo "▶ Gateway가 폴더째 읽는 locations·subsystems에서 새 릴리즈에 없는 .conf는 옮김(2026-11-26 multi.conf)"
+GW_ENV_FILE="$TEST_ROOT/etc/gw-env.conf"
+GW_ROOT="$TEST_ROOT/rb-acs-gw"
+RELEASE_LOCATIONS="common,multi" RELEASE_BUNDLE=total make_release "$TEST_ROOT/gw-v1.zip" 1.0.0 "$ALL_SERVICES" v1
+RELEASE_LOCATIONS="common,internal" RELEASE_BUNDLE=total make_release "$TEST_ROOT/gw-v2.zip" 2.0.0 "$ALL_SERVICES" -
+RELEASE_BUNDLE=service make_release "$TEST_ROOT/gw-v3-task.zip" 3.0.0 task -
+RELEASE_COMPOSE_SERVICES="$NEW_SERVICES,foo" RELEASE_LOCATIONS="common,multi,foo" RELEASE_BUNDLE=service \
+  make_release "$TEST_ROOT/gw-v4-foo.zip" 4.0.0 foo -
+gw_update() {  # 별도 설치(Gateway 남은 설정 시험)에 update.sh를 실행하고 종료 코드를 돌려준다.
+  ACS_ENV_FILE="$GW_ENV_FILE" ACS_ROOT="$GW_ROOT" bash "$KIT_DIR/update.sh" "$@" >/dev/null 2>&1
+  echo $?
+}
+gw_locations() {  # 설치된 locations의 .conf 이름(쉼표 구분)
+  (cd "$GW_ROOT/api-gateway/locations" && ls *.conf 2>/dev/null | sed 's/\.conf$//' | sort | paste -sd, -)
+}
+ACS_ENV_FILE="$GW_ENV_FILE" bash "$KIT_DIR/deploy.sh" --input="$TEST_ROOT/gw-v1.zip" --root="$GW_ROOT" --project=rb-acs-test \
+  --gateway-url=http://127.0.0.1:65530 --no-systemd >/dev/null 2>&1
+assert_equal "multi.conf가 든 릴리즈로 설치" "common,multi" "$(gw_locations)"
+echo "현장 메모" > "$GW_ROOT/api-gateway/locations/README.txt"
+echo "listen 13101;" > "$GW_ROOT/api-gateway/servers/custom.conf"
+
+# 새 릴리즈 헬스체크를 실패시키면 옮긴 multi.conf도 되살아나고 새 internal.conf는 지워진다.
+touch "$FAKE_STATE_DIR/unhealthy-internal"
+assert_equal "internal 헬스체크 실패면 되돌림" "1" "$(gw_update "$TEST_ROOT/gw-v2.zip")"
+rm -f "$FAKE_STATE_DIR/unhealthy-internal"
+assert_equal "되돌리면 multi.conf 복원·internal.conf 삭제" "common,multi" "$(gw_locations)"
+
+: > "$GW_ROOT/deploy/update.log"
+assert_equal "multi→internal 릴리즈 적용" "0" "$(gw_update "$TEST_ROOT/gw-v2.zip")"
+assert_equal "남은 multi.conf는 옮기고 internal.conf만 남음" "common,internal" "$(gw_locations)"
+assert_true "옮긴 설정 파일을 로그에 남김" grep -q "옮긴 설정 파일.*api-gateway/locations/multi.conf" "$GW_ROOT/deploy/update.log"
+assert_true "locations의 .conf가 아닌 현장 파일은 그대로" test -f "$GW_ROOT/api-gateway/locations/README.txt"
+assert_true "servers의 현장 파일은 그대로" test -f "$GW_ROOT/api-gateway/servers/custom.conf"
+gw_archive="$(ls -t "$GW_ROOT"/deploy/archives/*before-2.0.0-*.zip 2>/dev/null | head -n1)"
+assert_true "보관본에 업데이트 직전 multi.conf를 담음" bash -c "unzip -l '$gw_archive' | grep -q 'runtime/api-gateway/locations/multi.conf'"
+
+# 예전 형식(locations 폴더가 없는) ZIP은 아무것도 옮기지 않는다.
+assert_equal "locations 없는 서비스 ZIP 적용" "0" "$(gw_update "$TEST_ROOT/gw-v3-task.zip")"
+assert_equal "locations 없는 ZIP은 그대로 둠" "common,internal" "$(gw_locations)"
+
+# 버전 탭 되돌리기(보관본 적용)는 multi.conf를 되살리고 보관본에 없는 internal.conf를 옮긴다.
+cp "$gw_archive" "$TEST_ROOT/gw-rollback.zip"
+assert_equal "보관본으로 1.0.0 되돌리기" "0" "$(gw_update "$TEST_ROOT/gw-rollback.zip")"
+assert_equal "보관본 되돌리기 뒤 multi.conf만 남음" "common,multi" "$(gw_locations)"
+
+# 예전 릴리즈 ZIP을 다시 올려 내릴 때도 그 ZIP에 없는 새 파일은 옮긴다(예전 형식과의 호환).
+assert_equal "다시 2.0.0 적용" "0" "$(gw_update "$TEST_ROOT/gw-v2.zip")"
+assert_equal "예전 릴리즈 ZIP(1.0.0)으로 내리기" "0" "$(gw_update "$TEST_ROOT/gw-v1.zip")"
+assert_equal "예전 릴리즈 ZIP으로 내린 뒤 multi.conf만 남음" "common,multi" "$(gw_locations)"
+
+# 새 서비스만 든 ZIP도 설치된 서버에서는 되돌리기용 보관본을 만든다.
+assert_equal "새 서비스 foo만 든 ZIP 적용" "0" "$(gw_update "$TEST_ROOT/gw-v4-foo.zip")"
+assert_true "새 서비스만 든 ZIP도 보관본 생성" bash -c "ls '$GW_ROOT'/deploy/archives/*before-4.0.0-*.zip >/dev/null 2>&1"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

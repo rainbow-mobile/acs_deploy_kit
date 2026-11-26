@@ -781,6 +781,8 @@ def make_site_env(
 
 # 보관본 .env에서 뺄 이미지 태그 줄입니다. 보관본을 적용할 때 엔진이 설치된 이미지 태그를 다시 붙입니다.
 IMAGE_TAG_LINE_PREFIXES = ("ACS_IMAGE_TAG=", "# Gateway·Zenoh router 이미지 태그")
+# nginx가 폴더째 읽는 Gateway 설정 폴더입니다(include locations/*.conf, subsystems/*.conf). update.sh도 같은 두 곳만 정리합니다.
+GATEWAY_INCLUDED_DIRECTORIES = ("api-gateway/locations", "api-gateway/subsystems")
 
 
 def snapshot(staging_name: str, acs_root_name: str, installed_name: str, archives_name: str, architecture: str) -> None:
@@ -808,13 +810,21 @@ def snapshot(staging_name: str, acs_root_name: str, installed_name: str, archive
         bin_relative_path = f"services/{service_name}/{service_name}.{architecture}.bin"
         if (acs_root / bin_relative_path).is_file():
             service_files[service_name] = bin_relative_path
-    if not service_files:
+    # 새 서비스만 든 ZIP(설치된 bin 없음)도 설치된 서버라면 설정 파일만 든 보관본을 남깁니다. 처음 설치만 건너뜁니다.
+    if not service_files and not (installed.get("version") or installed_services):
         print("")
         return
 
     runtime_path = (new_manifest.get("runtime") or {}).get("path") or "runtime"
     runtime_contents = {}
-    for relative_path in ((new_manifest.get("runtime") or {}).get("files") or {}):
+    runtime_paths = list((new_manifest.get("runtime") or {}).get("files") or {})
+    # nginx가 폴더째 읽는 두 곳은 업데이트 직전 .conf를 통째로 담습니다. update.sh가 새 릴리즈에 없는 .conf를 옮기므로,
+    # 이 보관본을 다시 적용하면 옮긴 파일(예: multi.conf)이 돌아오고 보관본에 없는 새 파일(예: internal.conf)은 옮겨집니다.
+    for gateway_directory in GATEWAY_INCLUDED_DIRECTORIES:
+        runtime_paths.extend(
+            f"{gateway_directory}/{conf_path.name}" for conf_path in sorted((acs_root / gateway_directory).glob("*.conf"))
+        )
+    for relative_path in dict.fromkeys(runtime_paths):
         installed_path = acs_root / relative_path
         if not installed_path.is_file():
             continue

@@ -376,6 +376,21 @@ while IFS= read -r relative_path; do
   install -D -m 644 "$source_path" "$target_path"
   changed_runtime_paths+=("$target_relative_path")
 done < <(cd "$STAGING_DIR/runtime" && find . -type f -printf '%P\n' | sort)
+# nginx가 폴더째 읽는 곳(include locations/*.conf, subsystems/*.conf)에 새 릴리즈에 없는 옛 설정이 남으면 없는 upstream을
+# 가리켜 Gateway 검사가 실패한다(2026-11-26 multi→internal의 locations/multi.conf). 지우지 않고 되돌리기용 폴더로 옮긴다.
+# 그 폴더를 담지 않은 예전 형식 ZIP은 건너뛰고, 업데이트가 실패하면 rollback_changes가 그대로 되살린다.
+for gateway_directory in api-gateway/locations api-gateway/subsystems; do
+  [ -d "$STAGING_DIR/runtime/$gateway_directory" ] || continue
+  for installed_path in "$ACS_ROOT/$gateway_directory"/*.conf; do
+    [ -f "$installed_path" ] || continue
+    relative_path="$gateway_directory/$(basename "$installed_path")"
+    [ -f "$STAGING_DIR/runtime/$relative_path" ] && continue
+    install -D -m 644 "$installed_path" "$ROLLBACK_DIR/runtime/$relative_path" && rm -f "$installed_path" \
+      || fail_with_rollback "새 릴리즈에 없는 설정 파일을 옮기지 못했습니다: $relative_path"
+    changed_runtime_paths+=("$relative_path")
+    log "옮긴 설정 파일(새 릴리즈에 없음): $relative_path → $ROLLBACK_DIR/runtime/"
+  done
+done
 log "바뀐 설정 파일: ${changed_runtime_paths[*]:-없음}"
 
 # 릴리즈 밖의 HTTPS/WSS 설정을 준비합니다. 구버전 tls.sh도 dev 모드에서 옛 Gateway 검사를 건너뜁니다.
