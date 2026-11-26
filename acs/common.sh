@@ -140,8 +140,8 @@ acs_compose() {
 }
 
 # compose가 띄우는 ACS 서비스(bin 서비스). compose.offline.yml에서 ./services/<이름>을 마운트하는 서비스와 같다.
-# multi는 2026-11-23 릴리즈부터 들어간다. multi 없는 예전 설치에 서비스 ZIP만 올리면 통합 ZIP을 먼저 적용하라고 멈춘다.
-ACS_SERVICES=(common scenario task state external map mock multi)
+# internal(2026-11-25 multi에서 이름 바뀜)이 없는 예전 설치에 서비스 ZIP만 올리면 통합 ZIP을 먼저 적용하라고 멈춘다.
+ACS_SERVICES=(common scenario task state external map mock internal)
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"

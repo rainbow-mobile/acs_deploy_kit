@@ -151,14 +151,16 @@ acs observer restart      # 업데이트 감시 재시작 (status·logs도 됨)
 업데이트 엔진이 잠금(`deploy/.update.lock`)을 잡고 있는 동안에는 start·stop·restart를 거절합니다(종료 코드 75).
 엔진의 헬스체크·되돌리기와 겹치지 않게 하려는 것이고, 꼭 필요하면 `--force`를 붙입니다. 상태·로그 보기는 언제든 됩니다.
 
-## multi 서비스 (2026-11-23)
+## internal 서비스 (2026-11-25, 예전 multi)
 
-RB ACS 릴리즈에 multi(FMS 후보 중계, 포트 18007)가 다른 서비스처럼 서비스 bin(`services/multi/multi.amd64.bin`)으로 들어갑니다.
-키트의 ACS 서비스 목록(`common.sh` `ACS_SERVICES`)에도 multi를 넣어 헬스체크·되돌리기 확인, `acs restart|logs multi`, 서비스별 온라인 버전 확인에 포함합니다.
+RB ACS 릴리즈의 multi(FMS 후보 중계, 포트 18007)가 2026-11-25 internal로 이름이 바뀌었고 EVCS 이용도 맡습니다. 서비스 bin은 `services/internal/internal.amd64.bin`입니다.
+키트의 ACS 서비스 목록(`common.sh` `ACS_SERVICES`)도 multi 대신 internal을 넣어 헬스체크·되돌리기 확인, `acs restart|logs internal`, 서비스별 온라인 버전 확인에 포함합니다.
 
-- bin 교체는 릴리즈 매니페스트의 서비스 목록을 따르므로, 예전 키트도 multi가 든 릴리즈를 설치합니다. 다만 헬스체크와 `acs` 명령은 이 키트부터 multi를 다룹니다.
-- multi가 없는 예전 설치에 이 키트로 서비스 ZIP만 올리면 "설치되지 않은 서비스가 ZIP에도 없습니다: multi"로 바꾸기 전에 멈춥니다. multi가 든 통합 ZIP을 한 번 적용하면 풀립니다.
-- DB 주소는 `site.env`의 `MULTI_MONGO_URI`입니다. 예전 `site.env`에 없으면 compose가 공통 운영 URI(`SM_MONGO_URI`)를 씁니다.
+- 예전 키트(목록에 multi)로 internal 릴리즈를 올리면 `compose up --remove-orphans`가 multi 컨테이너를 지워 헬스체크가 `multi:missing`으로 시간 초과되고 되돌립니다. internal 릴리즈 전에 이 키트로 바꿉니다.
+- internal이 없는 예전 설치에 이 키트로 서비스 ZIP만 올리면 "설치되지 않은 서비스가 ZIP에도 없습니다: internal"로 바꾸기 전에 멈춥니다. internal이 든 통합 ZIP을 한 번 적용하면 풀립니다.
+- internal 릴리즈가 실패해 multi 버전으로 되돌리면, 되돌린 뒤 확인에서 internal이 missing이라 "일부 서비스가 healthy가 아닙니다" 경고가 남습니다. 되돌리기 자체는 끝납니다.
+- 현장의 `services/multi/` 폴더는 남지만 쓰지 않습니다.
+- DB 주소는 `site.env`의 `INTERNAL_MONGO_URI`입니다. 예전 `site.env`에 없으면 compose가 공통 운영 URI(`SM_MONGO_URI`)를 씁니다. DB 이름은 기존 이력을 쓰려고 `multi`를 유지합니다.
 
 ## 테스트
 
