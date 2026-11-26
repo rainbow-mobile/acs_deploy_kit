@@ -181,9 +181,14 @@ fail_with_rollback() {  # <message>
   write_status running rollback "$failure_message. 이전 버전으로 되돌리는 중"
   rollback_changes
   local rollback_result="이전 버전으로 되돌렸습니다"
+  # 되돌린 compose(이전 버전)의 서비스로 확인한다. 이름이 바뀐 릴리즈를 되돌려도 없는 서비스를 기다리지 않는다.
+  if ! load_acs_services; then
+    rollback_result="되돌렸지만 compose에서 서비스 목록을 읽지 못해 상태를 확인하지 못했습니다. docker compose 상태와 $UPDATE_LOG 로그를 확인하세요"
+    note_error "$rollback_result"
+  fi
   local rollback_health_targets=("${ACS_SERVICES[@]}")
   [ -n "$(acs_compose ps -q keycloak 2>/dev/null)" ] && rollback_health_targets+=(keycloak)
-  if ! wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${rollback_health_targets[@]}" >/dev/null; then
+  if [ ${#ACS_SERVICES[@]} -gt 0 ] && ! wait_services_healthy "$HEALTH_TIMEOUT_SEC" "${rollback_health_targets[@]}" >/dev/null; then
     rollback_result="되돌린 뒤에도 일부 서비스가 healthy가 아닙니다. docker compose 상태와 $UPDATE_LOG 로그를 확인하세요"
     note_error "$rollback_result"
   fi
@@ -252,13 +257,6 @@ IMAGES_ARCHIVE="$(release_tool get "$STAGING_DIR" images.archive)"
 log "버전 $CURRENT_VERSION, 서비스: ${UPDATED_SERVICES[*]:-없음}, 이미지 포함: ${IMAGES_ARCHIVE:-아니오}"
 
 [ -f "$ACS_ROOT/site.env" ] || fail_without_changes "site.env가 없습니다. deploy.sh로 설치하거나 site.env.example을 복사해 현장 값을 채우세요."
-missing_services=()
-for service_name in "${ACS_SERVICES[@]}"; do
-  if [ ! -f "$STAGING_DIR/services/$service_name/$service_name.$BIN_ARCH.bin" ] && [ ! -f "$ACS_ROOT/services/$service_name/$service_name.$BIN_ARCH.bin" ]; then
-    missing_services+=("$service_name")
-  fi
-done
-[ ${#missing_services[@]} -eq 0 ] || fail_without_changes "설치되지 않은 서비스가 ZIP에도 없습니다: ${missing_services[*]}. 전체 서비스 릴리즈로 설치하세요."
 
 # ── images ───────────────────────────────────────
 CURRENT_STAGE="images"
@@ -285,6 +283,17 @@ staged_compose_files=(-f "$STAGING_DIR/runtime/compose.yml" -f "$STAGING_DIR/run
 required_images="$(docker compose -p "$ACS_PROJECT" --project-directory "$ACS_ROOT" --env-file "$STAGING_DIR/runtime/.env.with-tag" --env-file "$ACS_ROOT/site.env" "${staged_compose_files[@]}" config --images 2> "$STAGING_DIR.err")" \
   || fail_without_changes "새 compose 설정을 해석하지 못했습니다: $(tail -n 3 "$STAGING_DIR.err")"
 rm -f "$STAGING_DIR.err"
+# 새 릴리즈 compose의 ACS 서비스마다 bin이 ZIP이나 설치 폴더에 있어야 한다(서비스 목록은 키트에 고정하지 않음).
+load_acs_services docker compose -p "$ACS_PROJECT" --project-directory "$ACS_ROOT" --env-file "$STAGING_DIR/runtime/.env.with-tag" \
+  --env-file "$ACS_ROOT/site.env" "${staged_compose_files[@]}" \
+  || fail_without_changes "새 compose에서 ACS 서비스를 찾지 못했습니다. site.env 필수 값과 릴리즈 compose를 확인하세요."
+missing_services=()
+for service_name in "${ACS_SERVICES[@]}"; do
+  if [ ! -f "$STAGING_DIR/services/$service_name/$service_name.$BIN_ARCH.bin" ] && [ ! -f "$ACS_ROOT/services/$service_name/$service_name.$BIN_ARCH.bin" ]; then
+    missing_services+=("$service_name")
+  fi
+done
+[ ${#missing_services[@]} -eq 0 ] || fail_without_changes "설치되지 않은 서비스가 ZIP에도 없습니다: ${missing_services[*]}. 전체 서비스 릴리즈로 설치하세요."
 observability_compose_path="$STAGING_DIR/runtime/infrastructure/observability/compose.yml"
 [ -f "$ACS_ROOT/infrastructure/observability/compose.yml" ] && observability_compose_path="$ACS_ROOT/infrastructure/observability/compose.yml"
 if [ -f "$observability_compose_path" ]; then
@@ -402,13 +411,10 @@ running_services=" $(acs_compose ps --services --status running 2>/dev/null | tr
 # 의존 순서(Waiting·Healthy)를 출력해 전체를 다시 띄우는 것처럼 보이고, 확인 시간만 든다. bin만 바뀐 서비스는 아래에서 재시작한다.
 compose_up_needed=0
 [ ${#changed_runtime_paths[@]} -gt 0 ] && compose_up_needed=1
-for service_name in "${ACS_SERVICES[@]}" api-gateway zenoh-router mongo postgres; do
+# 새 compose의 ACS 서비스·상시 인프라(keycloak 포함, 정의돼 있을 때만) 중 멈춘 것이 있으면 up으로 띄운다.
+for service_name in "${ACS_SERVICES[@]}" "${ACS_INFRA_SERVICES[@]}"; do
   [[ "$running_services" == *" $service_name "* ]] || compose_up_needed=1
 done
-if { [[ "$existing_services" == *" keycloak "* ]] || grep -q '^  keycloak:' "$ACS_ROOT/compose.offline.yml" 2>/dev/null; } \
-  && [[ "$running_services" != *" keycloak "* ]]; then
-  compose_up_needed=1
-fi
 if [ "$compose_up_needed" -eq 1 ]; then
   acs_compose up -d --no-build --pull never --remove-orphans || fail_with_rollback "compose up에 실패했습니다"
 else

@@ -169,21 +169,31 @@ acs observer restart      # 업데이트 감시 재시작 (status·logs도 됨)
 업데이트 엔진이 잠금(`deploy/.update.lock`)을 잡고 있는 동안에는 start·stop·restart를 거절합니다(종료 코드 75).
 엔진의 헬스체크·되돌리기와 겹치지 않게 하려는 것이고, 꼭 필요하면 `--force`를 붙입니다. 상태·로그 보기는 언제든 됩니다.
 
-## internal 서비스 (2026-11-25, 예전 multi)
+## 서비스·인프라 목록은 compose에서 읽음 (2026-11-26)
 
-RB ACS 릴리즈의 multi(FMS 후보 중계, 포트 18007)가 2026-11-25 internal로 이름이 바뀌었고 EVCS 이용도 맡습니다. 서비스 bin은 `services/internal/internal.amd64.bin`입니다.
-키트의 ACS 서비스 목록(`common.sh` `ACS_SERVICES`)도 multi 대신 internal을 넣어 헬스체크·되돌리기 확인, `acs restart|logs internal`, 서비스별 온라인 버전 확인에 포함합니다.
+키트는 ACS 서비스 이름과 인프라 이름을 고정해 두지 않습니다. 설치된(또는 적용할 릴리즈의) compose 최종 설정
+(`docker compose ... config --format json`)을 `release.py compose-services`로 나눠 씁니다. 그래서 rb_acs에 서비스가 추가되거나
+이름이 바뀌어도(예: 2026-11-25 multi → internal) 키트를 고치지 않습니다. 각 현장은 이 키트로 한 번만 바꾸면 됩니다.
 
-- 예전 키트(목록에 multi)로 internal 릴리즈를 올리면 `compose up --remove-orphans`가 multi 컨테이너를 지워 헬스체크가 `multi:missing`으로 시간 초과되고 되돌립니다. internal 릴리즈 전에 이 키트로 바꿉니다.
-- internal이 없는 예전 설치에 이 키트로 서비스 ZIP만 올리면 "설치되지 않은 서비스가 ZIP에도 없습니다: internal"로 바꾸기 전에 멈춥니다. internal이 든 통합 ZIP을 한 번 적용하면 풀립니다.
-- internal 릴리즈가 실패해 multi 버전으로 되돌리면, 되돌린 뒤 확인에서 internal이 missing이라 "일부 서비스가 healthy가 아닙니다" 경고가 남습니다. 되돌리기 자체는 끝납니다.
-- 현장의 `services/multi/` 폴더는 남지만 쓰지 않습니다.
-- DB 주소는 `site.env`의 `INTERNAL_MONGO_URI`입니다. 예전 `site.env`에 없으면 compose가 공통 운영 URI(`SM_MONGO_URI`)를 씁니다. DB 이름은 기존 이력을 쓰려고 `multi`를 유지합니다.
+| 구분 | 기준 | 지금 compose에서 |
+|---|---|---|
+| ACS 서비스 | `command` 첫 값이 `/app/service/<자기 이름>.<arch>.bin` | common·scenario·task·state·external·map·mock·internal |
+| 상시 인프라 | 위가 아니면서 `restart`가 `no`가 아님 | api-gateway·zenoh-router·mongo·postgres·keycloak(정의돼 있을 때만) |
+| 일회성 작업(제외) | `restart: no` | db-prepare |
+
+- `update.sh`: bin 확인은 **새 릴리즈 compose**, `compose up` 판단·헬스체크는 같은 새 목록, 실패해 되돌린 뒤 확인은 **되돌린 compose**로 읽습니다.
+  그래서 이름이 바뀐 릴리즈를 적용하거나 되돌려도 없는 서비스(`multi:missing` 등)를 기다리지 않습니다.
+- `acs.sh`: `acs restart|logs <이름>`에 쓸 수 있는 이름이 설치된 compose의 ACS 서비스와 상시 인프라입니다. 상태 보기는 목록을 읽지 않습니다.
+- `observer.sh`: 서비스별 온라인 버전은 설치된 compose의 ACS 서비스만 봅니다. 목록을 못 읽으면 통합 버전만 봅니다.
+- compose에서 목록을 못 읽으면(`site.env` 필수 값 누락 등) 업데이트는 설정·bin을 바꾸기 전에 "새 compose에서 ACS 서비스를 찾지 못했습니다"로 멈춥니다.
+- rb_acs에 상시 인프라를 추가할 때는 `restart: unless-stopped`를 붙여야 키트가 멈춘 컨테이너를 알아봅니다. ACS 서비스는 지금처럼 `/app/service/<이름>.<arch>.bin`을 실행합니다.
+- 현장의 `services/multi/` 폴더는 남지만 쓰지 않습니다. Internal DB 주소는 `site.env`의 `INTERNAL_MONGO_URI`(없으면 `SM_MONGO_URI`)이고 DB 이름은 기존 이력을 쓰려고 `multi`를 유지합니다.
 
 ## 테스트
 
 ```bash
 bash tests/test-update.sh
+python3 -m unittest acs.tests.test_tls_query   # 키트 루트에서
 ```
 
 `tests/`는 운영 파일은 아니지만 설치·부분 업데이트·검증·롤백·observer가 깨지지 않았는지 한 파일로 확인하기 위해 유지합니다. 실제 컨테이너는 띄우지 않습니다.

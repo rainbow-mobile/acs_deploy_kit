@@ -19,13 +19,42 @@ FAILURES=0
 TEST_COUNT=0
 
 # ── 가짜 docker: compose ps -q는 컨테이너 ID, inspect는 healthy(FAKE_STATE_DIR/unhealthy-<서비스>가 있으면 unhealthy) ──
+# compose 서비스 목록은 넘겨받은 compose.offline.yml의 표시 줄(# acs-services: ·# infra-services:)에서 읽고, 없으면 지금 릴리즈 기본값을 쓴다.
 cat > "$FAKE_BIN_DIR/docker" <<'EOF'
 #!/bin/bash
 echo "docker $*" >> "$FAKE_LOG"
+compose_list() {  # <acs|infra> : 이번 호출의 compose.offline.yml에 적힌 목록
+  local compose_path="" previous="" argument marker default_list
+  for argument in "$@"; do
+    [ "$previous" = "-f" ] && [[ "$argument" == *compose.offline.yml ]] && compose_path="$argument"
+    previous="$argument"
+  done
+  if [ "$COMPOSE_KIND" = "acs" ]; then
+    marker="# acs-services:"; default_list="common,scenario,task,state,external,map,mock,internal"
+  else
+    marker="# infra-services:"; default_list="api-gateway,zenoh-router,mongo,postgres,keycloak"
+    [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] && default_list="api-gateway,zenoh-router,mongo,postgres"
+  fi
+  local found_line=""
+  [ -n "$compose_path" ] && [ -f "$compose_path" ] && found_line="$(grep -m1 "^$marker" "$compose_path" | sed "s/^$marker *//")"
+  echo "${found_line:-$default_list}" | tr ',' '\n'
+}
 if [ "${1:-}" = "compose" ]; then
   case " $* " in
     *" version --short "*) echo "2.39.1"; exit 0 ;;
     *" version "*) echo "Docker Compose version v2.39.1"; exit 0 ;;
+    *" config --format json "*)
+      [ -f "$FAKE_STATE_DIR/compose-config-fails" ] && { echo "required variable is missing" >&2; exit 1; }
+      acs_services="$(COMPOSE_KIND=acs compose_list "$@")"
+      infra_services="$(COMPOSE_KIND=infra compose_list "$@")"
+      python3 -I -c '
+import json, sys
+acs_services, infra_services = sys.argv[1].split(), sys.argv[2].split()
+services = {name: {"command": [f"/app/service/{name}.amd64.bin"], "restart": "unless-stopped"} for name in acs_services}
+services.update({name: {"restart": "unless-stopped"} for name in infra_services})
+services["db-prepare"] = {"command": ["/app/service/external.amd64.bin", "--python", "/app/prepare_accounts.pyc"], "restart": "no"}
+print(json.dumps({"services": services}))' "$acs_services" "$infra_services"
+      exit 0 ;;
     *" config --images "*)
       if [[ "$*" == *infrastructure/observability/compose.yml* ]]; then
         printf '%s\n' grafana/loki:3.5.3 grafana/alloy:v1.10.2
@@ -39,13 +68,15 @@ if [ "${1:-}" = "compose" ]; then
     # compose up 뒤에는 모든 컨테이너가 있는 것으로 답한다.
     *" ps --services --status running "*)
       if [ -f "$FAKE_STATE_DIR/containers-created" ]; then
-        printf '%s\n' common scenario task state external map mock internal api-gateway zenoh-router mongo postgres
+        COMPOSE_KIND=acs compose_list "$@"
+        COMPOSE_KIND=infra compose_list "$@" | grep -v -x keycloak
         [ -f "$FAKE_STATE_DIR/keycloak-stopped" ] || [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] || echo keycloak
       fi
       exit 0 ;;
     *" ps -a --services "*)
       if [ -f "$FAKE_STATE_DIR/containers-created" ]; then
-        printf '%s\n' common scenario task state external map mock internal api-gateway zenoh-router mongo postgres
+        COMPOSE_KIND=acs compose_list "$@"
+        COMPOSE_KIND=infra compose_list "$@" | grep -v -x keycloak
         [ -f "$FAKE_STATE_DIR/no-keycloak-container" ] || echo keycloak
       fi
       exit 0 ;;
@@ -181,6 +212,12 @@ release_branch = os.environ.get("RELEASE_BRANCH")
 # 묶음 종류(RELEASE_BUNDLE: total·service·quick). 없으면 예전 ZIP처럼 bundle을 적지 않습니다.
 release_bundle = os.environ.get("RELEASE_BUNDLE")
 smc_conf = sys.argv[5] if len(sys.argv) > 5 else "listen 13100;\n"
+# 릴리즈 compose의 서비스·인프라 목록(가짜 docker가 compose.offline.yml 표시 줄로 읽음). 없으면 기본 목록입니다.
+compose_offline = f"# {version}\n"
+if os.environ.get("RELEASE_COMPOSE_SERVICES"):
+    compose_offline += f"# acs-services: {os.environ['RELEASE_COMPOSE_SERVICES']}\n"
+if os.environ.get("RELEASE_COMPOSE_INFRA"):
+    compose_offline += f"# infra-services: {os.environ['RELEASE_COMPOSE_INFRA']}\n"
 entries = {}
 services = {}
 for service_name in services_csv.split(","):
@@ -189,7 +226,7 @@ for service_name in services_csv.split(","):
     entries[path] = content
     services[service_name] = {"version": service_version, "path": path, "sha256": hashlib.sha256(content).hexdigest()}
 runtime_files = {
-    "compose.yml": b"services: {}\n", "compose.offline.yml": f"# {version}\n".encode(), ".env": b"TASK_PORT=18002\n",
+    "compose.yml": b"services: {}\n", "compose.offline.yml": compose_offline.encode(), ".env": b"TASK_PORT=18002\n",
     "tls.sh": (
         b"#!/bin/bash\n"
         b"echo \"tls $1 $2 $ACS_PROJECT\" >> \"$FAKE_LOG\"\n"
@@ -1110,6 +1147,70 @@ assert_equal "인증 환경(no-curl) 실행 중 Task 집계" "1" "$(json_value "
 assert_equal "인증 비밀값 불일치 시 unknown 반환" "unknown" "$(json_value "$TEST_ROOT/auth-task-results.json" bad_secret)"
 assert_equal "인증 환경에서 실행 중 Task가 있으면 update.sh 대기(75)" "75" "$(json_value "$TEST_ROOT/auth-task-results.json" busy_update_exit)"
 assert_equal "M2M 비밀값·발급 토큰은 로그 미노출" "True" "$(json_value "$TEST_ROOT/auth-task-results.json" secrets_hidden)"
+
+echo "▶ 서비스·인프라 목록은 설치된 compose에서 읽음(서비스 추가·이름 변경 때 키트를 고치지 않음, 2026-11-26)"
+assert_true "키트에 고정 ACS 서비스 목록이 없음" bash -c "! grep -E -q '^ACS_SERVICES=\\([a-z]' '$KIT_DIR/common.sh'"
+assert_true "키트에 고정 인프라 이름이 없음(update.sh·acs.sh)" bash -c \
+  "! grep -E -q 'api-gateway zenoh-router (keycloak )?mongo postgres' '$KIT_DIR/update.sh' '$KIT_DIR/acs.sh'"
+AUTO_ENV_FILE="$TEST_ROOT/etc/auto-env.conf"
+AUTO_ROOT="$TEST_ROOT/rb-acs-auto"
+OLD_SERVICES="common,scenario,task,state,external,map,mock,multi"
+NEW_SERVICES="common,scenario,task,state,external,map,mock,internal"
+RELEASE_COMPOSE_SERVICES="$OLD_SERVICES" RELEASE_BUNDLE=total make_release "$TEST_ROOT/auto-v1.zip" 1.0.0 "$OLD_SERVICES" v1
+RELEASE_COMPOSE_SERVICES="$NEW_SERVICES" RELEASE_BUNDLE=total make_release "$TEST_ROOT/auto-v2.zip" 2.0.0 "$NEW_SERVICES" -
+RELEASE_COMPOSE_SERVICES="$NEW_SERVICES,foo" RELEASE_BUNDLE=total make_release "$TEST_ROOT/auto-v3.zip" 3.0.0 "$NEW_SERVICES,foo" -
+RELEASE_COMPOSE_SERVICES="$NEW_SERVICES,foo" RELEASE_COMPOSE_INFRA="api-gateway,zenoh-router,mongo,postgres" RELEASE_BUNDLE=total \
+  make_release "$TEST_ROOT/auto-v4.zip" 4.0.0 task -
+auto_update() {  # 별도 설치(multi→internal 이름 변경 시험)에 update.sh를 실행하고 종료 코드를 돌려준다.
+  ACS_ENV_FILE="$AUTO_ENV_FILE" ACS_ROOT="$AUTO_ROOT" bash "$KIT_DIR/update.sh" "$@" >/dev/null 2>&1
+  echo $?
+}
+auto_acs() {  # 별도 설치에 acs 명령을 실행하고 종료 코드를 돌려준다.
+  ACS_ENV_FILE="$AUTO_ENV_FILE" ACS_ROOT="$AUTO_ROOT" bash "$KIT_DIR/acs.sh" "$@" >/dev/null 2>&1
+  echo $?
+}
+ACS_ENV_FILE="$AUTO_ENV_FILE" bash "$KIT_DIR/deploy.sh" --input="$TEST_ROOT/auto-v1.zip" --root="$AUTO_ROOT" --project=rb-acs-test \
+  --gateway-url=http://127.0.0.1:65530 --no-systemd >/dev/null 2>&1
+assert_equal "multi가 든 예전 compose로 설치" "0" "$?"
+assert_equal "예전 설치에서 acs restart multi" "0" "$(auto_acs restart multi)"
+assert_equal "예전 설치에는 internal이 없음(사용법 오류)" "2" "$(auto_acs restart internal)"
+
+# 새 릴리즈(internal) 헬스체크를 실패시키면, 되돌린 뒤에는 되돌린 compose(multi)를 확인한다.
+touch "$FAKE_STATE_DIR/unhealthy-internal"
+: > "$FAKE_LOG"
+assert_equal "internal 헬스체크 실패면 되돌림" "1" "$(auto_update "$TEST_ROOT/auto-v2.zip")"
+rm -f "$FAKE_STATE_DIR/unhealthy-internal"
+assert_true "헬스체크에서 새 compose의 internal을 확인" grep -q "ps -q internal" "$FAKE_LOG"
+rollback_log="$(sed -n '/ps -q internal/,$p' "$FAKE_LOG")"
+assert_true "되돌린 뒤에는 되돌린 compose의 multi를 확인" grep -q "ps -q multi" <<< "$rollback_log"
+assert_true "되돌린 뒤 일부 서비스 비정상 경고 없음" bash -c "! grep -q '되돌린 뒤에도 일부 서비스가 healthy가 아닙니다' '$AUTO_ROOT/deploy/status.json'"
+
+# 같은 릴리즈를 정상 적용하면 multi는 찾지 않고 internal만 확인한다.
+: > "$FAKE_LOG"
+assert_equal "multi→internal 이름 변경 릴리즈 적용" "0" "$(auto_update "$TEST_ROOT/auto-v2.zip")"
+assert_true "이름 변경 뒤 헬스체크는 internal" grep -q "ps -q internal" "$FAKE_LOG"
+assert_true "이름 변경 뒤 multi는 찾지 않음" bash -c "! grep -q 'ps -q multi' '$FAKE_LOG'"
+assert_equal "이름 변경 뒤 acs restart internal" "0" "$(auto_acs restart internal)"
+assert_equal "이름 변경 뒤 multi는 사용법 오류" "2" "$(auto_acs restart multi)"
+
+# 키트를 고치지 않아도 새 서비스(foo)가 헬스체크·acs 명령 대상에 들어간다.
+: > "$FAKE_LOG"
+assert_equal "새 서비스 foo가 든 릴리즈 적용" "0" "$(auto_update "$TEST_ROOT/auto-v3.zip")"
+assert_true "새 서비스 foo도 헬스체크" grep -q "ps -q foo" "$FAKE_LOG"
+assert_equal "새 서비스 foo도 acs restart" "0" "$(auto_acs restart foo)"
+
+# 인프라 목록도 compose에서 읽으므로 keycloak이 없는 compose에서는 keycloak을 고를 수 없다.
+assert_equal "keycloak 없는 compose 릴리즈 적용" "0" "$(auto_update "$TEST_ROOT/auto-v4.zip")"
+assert_equal "keycloak 없는 compose에서 acs restart keycloak은 사용법 오류" "2" "$(auto_acs restart keycloak)"
+assert_equal "인프라 api-gateway는 acs restart 가능" "0" "$(auto_acs restart api-gateway)"
+
+# compose에서 서비스 목록을 못 읽으면(site.env 필수값 누락 등) 바꾸기 전에 멈춘다.
+cp "$AUTO_ROOT/services/task/task.amd64.bin" "$TEST_ROOT/auto-task-before-config-fail.bin"
+touch "$FAKE_STATE_DIR/compose-config-fails"
+assert_equal "compose 목록을 못 읽으면 업데이트 중단" "1" "$(auto_update "$TEST_ROOT/auto-v3.zip")"
+rm -f "$FAKE_STATE_DIR/compose-config-fails"
+assert_true "목록을 못 읽은 업데이트는 bin을 바꾸지 않음" cmp -s "$TEST_ROOT/auto-task-before-config-fail.bin" "$AUTO_ROOT/services/task/task.amd64.bin"
+assert_true "목록을 못 읽은 이유를 상태에 기록" grep -q "ACS 서비스를 찾지 못했습니다" "$AUTO_ROOT/deploy/status.json"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

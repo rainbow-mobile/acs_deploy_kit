@@ -994,6 +994,26 @@ def online_next(online_name: str, installed_name: str) -> None:
     print("")
 
 
+def compose_services(architecture: str) -> None:
+    """compose 최종 설정 JSON(표준 입력)을 ACS 서비스와 상시 인프라로 나눠 출력합니다.
+
+    키트가 서비스 이름을 고정해 두지 않고 설치된 compose를 따르게 하려는 것입니다(2026-11-26).
+    command가 `/app/service/<자기 이름>.<arch>.bin`이면 ACS 서비스, 아니면서 restart가 no가 아니면 상시 인프라입니다.
+    restart가 no인 일회성 작업(db-prepare 등)은 출력하지 않습니다.
+
+    Args:
+        architecture (str): 서비스 bin의 arch(amd64·arm64)입니다.
+    """
+    services = json.load(sys.stdin).get("services") or {}
+    for service_name in sorted(services):
+        service = services[service_name] or {}
+        command = service.get("command") or []
+        if command and command[0] == f"/app/service/{service_name}.{architecture}.bin":
+            print(f"service {service_name}")
+        elif (service.get("restart") or "no") != "no":
+            print(f"infra {service_name}")
+
+
 def main(arguments: list[str]) -> None:
     """명령 이름으로 처리 함수를 고릅니다.
 
@@ -1045,6 +1065,8 @@ def main(arguments: list[str]) -> None:
         online_describe(*command_arguments)
     elif command_name == "online-next" and len(command_arguments) == 2:
         online_next(*command_arguments)
+    elif command_name == "compose-services" and len(command_arguments) == 1:
+        compose_services(*command_arguments)
     else:
         fail(f"알 수 없는 명령이거나 인자 수가 다릅니다: {' '.join(arguments)}")
 

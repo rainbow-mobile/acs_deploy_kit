@@ -9,7 +9,7 @@
 #   version              설치된 전체·서비스별 버전
 #   observer [status|restart|logs]  업데이트 감시(systemd acs-update-observer)
 #   --force              업데이트 중이어도 start·stop·restart를 한다(업데이트 엔진의 헬스체크·되돌리기와 겹칠 수 있음)
-# 서비스: common scenario task state external map mock internal api-gateway zenoh-router keycloak mongo postgres
+# 서비스: 설치된 compose의 ACS 서비스(예: task, internal)와 상시 인프라(예: api-gateway, keycloak, mongo). 이름은 compose에서 읽는다
 # 종료 코드: 0 성공, 2 사용법 오류, 75 업데이트 중이라 거절, 그 밖은 docker compose 종료 코드.
 # compose 파일·env 파일·프로젝트 이름은 업데이트 엔진과 같은 common.sh acs_compose를 쓴다.
 
@@ -24,8 +24,6 @@ load_acs_env
 # 로그를 처음에 보여 줄 줄 수입니다.
 LOG_TAIL_LINES=200
 OBSERVER_SERVICE_NAME="acs-update-observer"
-# 이름으로 고를 수 있는 compose 서비스입니다(ACS 서비스 + 인프라).
-CONTROL_SERVICES=("${ACS_SERVICES[@]}" api-gateway zenoh-router keycloak mongo postgres)
 
 print_usage() {
   sed -n '2,14p' "$SCRIPT_DIR/acs.sh" | sed 's/^# \{0,1\}//'
@@ -44,11 +42,18 @@ for argument in "$@"; do
 done
 
 # 서비스 이름을 확인한다. 틀리면 compose 오류 대신 고를 수 있는 이름을 보여 준다.
+# 고를 수 있는 이름(ACS 서비스 + 상시 인프라)은 설치된 compose에서 읽는다. 이름을 준 명령에서만 읽어 상태 보기를 늦추지 않는다.
 check_service_names() {
-  local service_name
+  local service_name control_services=()
+  [ ${#SERVICE_NAMES[@]} -gt 0 ] || return 0
+  if ! load_acs_services; then
+    echo "설치된 compose에서 서비스 목록을 읽지 못했습니다($ACS_ROOT). 설치 상태와 site.env를 확인하세요." >&2
+    exit 2
+  fi
+  control_services=("${ACS_SERVICES[@]}" "${ACS_INFRA_SERVICES[@]}")
   for service_name in "${SERVICE_NAMES[@]}"; do
-    if [[ " ${CONTROL_SERVICES[*]} " != *" $service_name "* ]]; then
-      echo "알 수 없는 서비스입니다: $service_name (고를 수 있는 서비스: ${CONTROL_SERVICES[*]})" >&2
+    if [[ " ${control_services[*]} " != *" $service_name "* ]]; then
+      echo "알 수 없는 서비스입니다: $service_name (고를 수 있는 서비스: ${control_services[*]})" >&2
       exit 2
     fi
   done

@@ -139,9 +139,27 @@ acs_compose() {
     "${compose_files[@]}" "$@"
 }
 
-# compose가 띄우는 ACS 서비스(bin 서비스). compose.offline.yml에서 ./services/<이름>을 마운트하는 서비스와 같다.
-# internal(2026-11-25 multi에서 이름 바뀜)이 없는 예전 설치에 서비스 ZIP만 올리면 통합 ZIP을 먼저 적용하라고 멈춘다.
-ACS_SERVICES=(common scenario task state external map mock internal)
+# ACS 서비스(bin 서비스)와 상시 인프라 목록. 키트에 고정하지 않고 compose 최종 설정에서 읽는다(2026-11-26).
+# 서비스를 추가하거나 이름을 바꿔도 릴리즈 compose만 따라가므로 키트를 고치지 않는다(기준은 release.py compose-services).
+ACS_SERVICES=()
+ACS_INFRA_SERVICES=()
+
+# compose에서 ACS_SERVICES·ACS_INFRA_SERVICES를 채운다. 인자를 주면 그 compose 실행 명령(새 릴리즈 확인 등)으로 읽는다.
+# 못 읽거나 ACS 서비스가 하나도 없으면 1을 돌려준다(빈 목록으로 헬스체크를 통과시키지 않으려는 것).
+load_acs_services() {  # [compose 실행 명령...]
+  local compose_command=("$@") classified_services kind service_name
+  [ ${#compose_command[@]} -gt 0 ] || compose_command=(acs_compose)
+  ACS_SERVICES=()
+  ACS_INFRA_SERVICES=()
+  classified_services="$("${compose_command[@]}" config --format json 2>/dev/null | release_tool compose-services "$(host_arch)")" || return 1
+  while read -r kind service_name; do
+    case "$kind" in
+      service) ACS_SERVICES+=("$service_name") ;;
+      infra) ACS_INFRA_SERVICES+=("$service_name") ;;
+    esac
+  done <<< "$classified_services"
+  [ ${#ACS_SERVICES[@]} -gt 0 ]
+}
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"

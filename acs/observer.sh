@@ -64,6 +64,8 @@ refresh_online_status() {
   else
     failed_count=1
   fi
+  # 서비스별 최신 버전은 설치된 compose의 ACS 서비스만 본다. 목록을 못 읽으면 통합 버전만 확인한다.
+  load_acs_services || log "⚠️  설치된 compose에서 서비스 목록을 읽지 못해 서비스별 온라인 버전은 건너뜁니다."
   for service_name in "${ACS_SERVICES[@]}"; do
     if download_file "$ACS_RELEASE_BASE_URL/$service_name/version.json" "$check_dir/services/$service_name.json" 8 2>>"$check_dir/error" \
       && [ -s "$check_dir/services/$service_name.json" ]; then
