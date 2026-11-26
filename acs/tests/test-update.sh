@@ -190,6 +190,11 @@ for service_name in services_csv.split(","):
     services[service_name] = {"version": service_version, "path": path, "sha256": hashlib.sha256(content).hexdigest()}
 runtime_files = {
     "compose.yml": b"services: {}\n", "compose.offline.yml": f"# {version}\n".encode(), ".env": b"TASK_PORT=18002\n",
+    "tls.sh": (
+        b"#!/bin/bash\n"
+        b"echo \"tls $1 $2 $ACS_PROJECT\" >> \"$FAKE_LOG\"\n"
+        b"[ ! -f \"$FAKE_STATE_DIR/tls-apply-fails\" ]\n"
+    ),
     "site.env.example": (
         b"# example\nPOSTGRES_PASSWORD=change-me\nMONGO_INITDB_ROOT_USERNAME=acs_admin\n"
         b"MONGO_INITDB_ROOT_PASSWORD=\nACS_RUNTIME_PASSWORD_ENCODED=\nACS_SCHEMA_PASSWORD_ENCODED=\n"
@@ -277,6 +282,7 @@ assert_true "task bin 실행 권한" test -x "$ACS_ROOT/services/task/task.amd64
 assert_true "internal bin 실행 권한" test -x "$ACS_ROOT/services/internal/internal.amd64.bin"
 assert_true "이미지 load" grep -q "docker load -i" "$FAKE_LOG"
 assert_true "최초 설치는 DB 백업을 하지 않음" bash -c "! grep -q mongodump '$FAKE_LOG'"
+assert_true "최초 설치에서 현장 TLS 설정 적용" grep -Fqx "tls apply $ACS_ROOT/site.env rb-acs-test" "$FAKE_LOG"
 assert_true "최초 설치는 compose up이 만든 컨테이너를 다시 재시작하지 않음" bash -c "! grep -q ' restart ' '$FAKE_LOG'"
 assert_true "최초 설치는 이전 버전 보관본이 없음" bash -c "! ls '$ACS_ROOT'/deploy/archives/*.zip >/dev/null 2>&1"
 assert_true "최초 설치는 기존 Loki·Alloy 자동 기동" grep -E -q 'infrastructure/observability/compose.yml up -d .*loki alloy' "$FAKE_LOG"
@@ -360,6 +366,15 @@ echo '# 현장 관측 포트·볼륨 유지' >> "$ACS_ROOT/infrastructure/observ
 cp "$ACS_ROOT/infrastructure/observability/compose.yml" "$TEST_ROOT/observability-before-update.yml"
 : > "$FAKE_LOG"
 assert_equal "v2(task) 적용 종료 코드" "0" "$(run_update "$TEST_ROOT/acs-v2-task.zip")"
+assert_true "부분 업데이트에서 현장 TLS 설정 적용" grep -Fqx "tls apply $ACS_ROOT/site.env rb-acs-test" "$FAKE_LOG"
+assert_true "TLS 설정을 컨테이너 기동 전에 적용" python3 -I - "$FAKE_LOG" <<'PYEOF'
+import sys
+from pathlib import Path
+commands = Path(sys.argv[1]).read_text().splitlines()
+tls_position = next(index for index, command in enumerate(commands) if command.startswith("tls apply "))
+startup_position = next(index for index, command in enumerate(commands) if " up -d " in command)
+raise SystemExit(0 if tls_position < startup_position else 1)
+PYEOF
 assert_true "task bin은 v2" grep -q "task v2" "$ACS_ROOT/services/task/task.amd64.bin"
 assert_true "state bin은 v1 그대로" grep -q "state v1" "$ACS_ROOT/services/state/state.amd64.bin"
 assert_equal "서비스별 버전(task)" "v2" "$(json_value "$ACS_ROOT/deploy/installed.json" services.task.version)"
@@ -380,6 +395,11 @@ assert_equal "단계 진행(validate → … → done)" "validate images backup 
 assert_true "끝난 단계에 끝난 시각" test -n "$(json_value "$cli_run" stages.0.ended_at)"
 assert_equal "이력에 실행 ID" "$(json_value "$cli_run" run_id)" "$(json_value "$ACS_ROOT/deploy/installed.json" history.-1.run_id)"
 assert_equal "이력에 출처" "cli" "$(json_value "$ACS_ROOT/deploy/installed.json" history.-1.source)"
+
+touch "$FAKE_STATE_DIR/tls-apply-fails"
+assert_equal "TLS 적용 실패 시 업데이트 중단" "1" "$(run_update "$TEST_ROOT/acs-v3-state.zip")"
+assert_equal "TLS 적용 실패 시 설치 버전 보존" "v2" "$(json_value "$ACS_ROOT/deploy/installed.json" services.task.version)"
+rm -f "$FAKE_STATE_DIR/tls-apply-fails"
 
 echo "▶ 업데이트 전 상태를 버전을 적은 보관본 ZIP으로 남기고, 그 ZIP으로 되돌릴 수 있음"
 snapshot_path="$(ls "$ACS_ROOT"/deploy/archives/acs-rollback-v1-before-v2-*.zip 2>/dev/null | head -n1)"
