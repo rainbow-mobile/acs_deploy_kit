@@ -378,9 +378,9 @@ while IFS= read -r relative_path; do
 done < <(cd "$STAGING_DIR/runtime" && find . -type f -printf '%P\n' | sort)
 log "바뀐 설정 파일: ${changed_runtime_paths[*]:-없음}"
 
-# 릴리즈 밖의 HTTPS/WSS 활성화 상태를 Gateway가 시작하기 전에 복원합니다.
+# 릴리즈 밖의 HTTPS/WSS 설정을 준비합니다. 구버전 tls.sh도 dev 모드에서 옛 Gateway 검사를 건너뜁니다.
 if [ -f "$ACS_ROOT/tls.sh" ]; then
-  ACS_PROJECT="$ACS_PROJECT" bash "$ACS_ROOT/tls.sh" apply "$ACS_ROOT/site.env" \
+  TLS_PRESTART_ONLY=true TLS_COMPOSE_MODE=dev ACS_PROJECT="$ACS_PROJECT" bash "$ACS_ROOT/tls.sh" apply "$ACS_ROOT/site.env" \
     || fail_with_rollback "Gateway TLS 설정 적용에 실패했습니다"
 fi
 
